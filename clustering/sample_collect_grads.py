@@ -44,6 +44,28 @@ def collate(batch):
     labels = torch.tensor([pad(l) for l in labels], dtype=torch.long)
     return toks.cuda(), labels.cuda(), [b["__key__"] for b in batch]
 
+def prepare_model(model):
+    model_parameters = sum(p.numel() for p in model.parameters())
+    handler = LoRAHandler(rank=args.lora_rank)
+    logger = Logger(model_parameters)
+    handler.add_lora(model, logger, train_loader.batch_size)
+
+    print(
+        f"Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
+    )
+    for name, param in model.named_parameters():
+        if "logix_lora_B" not in name:
+            param.requires_grad = False
+    print(
+        f"Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model.to(device)
+    model.eval()
+    # TODO: add the removal of randomness
+
 def main(args):
     # ---------- model & projection vector size ----------
     model   = load_fixed_model(args.ckpt)
