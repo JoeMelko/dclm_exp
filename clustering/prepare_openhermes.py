@@ -42,6 +42,7 @@ def main(args):
         padding_side="right",
         truncation_side="right"
     )
+    tok.pad_token = tok.eos_token
     os.makedirs(args.out_dir, exist_ok=True)
     sink   = shard_writer(args.out_dir, args.shard_size)
     seq    = 0
@@ -51,12 +52,14 @@ def main(args):
                   text_target=answer,
                   max_length=args.seqlen,
                   truncation=True,
-                  padding=False,
+                  padding='max_length',
                   return_tensors="np")
 
         # labels have -100 wherever the token came from the prompt
         tokens  = enc["input_ids"][0].astype(np.int32)
         labels  = enc["labels"   ][0].astype(np.int32)
+        # sanity check
+        labels[tokens == tok.pad_token_id] = -100
 
         sink.write({
             "__key__"     : f"{seq:012d}",
