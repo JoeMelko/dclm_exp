@@ -58,21 +58,28 @@ def main(args):
         labels      = input_ids.copy()
 
         # 3. Mask prompt positions
-        labels[:len(prompt_ids)] = -100
+        labels[:len(prompt_ids)] = [-100] * len(prompt_ids)
 
-        # 4. Pad/truncate to fixed length
-        enc = tok.pad(
-            {"input_ids": input_ids, "labels": labels},
-            padding="max_length",
-            max_length=args.seqlen
-        )
+        # 4. Pad/truncate to fixed length for both tokens and labels
+        if len(input_ids) < args.seqlen:
+            tokens_list = input_ids + [tok.pad_token_id] * (args.seqlen - len(input_ids))
+        else:
+            tokens_list = input_ids[:args.seqlen]
 
-        # labels have -100 wherever the token came from the prompt
-        tokens  = enc["input_ids"][0].astype(np.int32)
-        labels  = enc["labels"   ][0].astype(np.int32)
+        # Manually pad / truncate labels to match the fixed sequence length.
+        if len(labels) < args.seqlen:
+            labels_list = labels + [-100] * (args.seqlen - len(labels))
+        else:
+            labels_list = labels[:args.seqlen]
+
+        # Convert to NumPy arrays for efficient downstream processing.
+        tokens = np.asarray(tokens_list, dtype=np.int32)
+        labels = np.asarray(labels_list, dtype=np.int32)
+
         # sanity check
         labels[tokens == tok.pad_token_id] = -100
 
+        # 5. Write to shard 
         sink.write({
             "__key__"     : f"{seq:012d}",
             "tokens.npy"  : tokens,

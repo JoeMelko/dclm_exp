@@ -216,7 +216,7 @@ def main(args):
 
     manifest_path = wds_dir_path / "manifest.jsonl"
     with open(manifest_path) as mf:
-        N_est = int(mf.read().split(",")[1])
+        N_est = int(mf.read().split(",")[1]) + 1_000
 
     grads = np.memmap(args.out, mode = "w+", dtype = DTYPE_OUT,
                       shape = (N_est, logger.grads.shape[0], logger.grads.shape[2]))
@@ -232,8 +232,6 @@ def main(args):
         with torch.enable_grad():
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 out  = model(input_ids = toks, labels = labels)
-                breakpoint()
-                print(out.loss)
                 out.loss.mul_(1024)
                 out.loss.backward()
             features = (
@@ -245,6 +243,9 @@ def main(args):
         for k in keys:
             index.write(f"{row_offset}\t{k}\n")
             row_offset += 1
+        if step % 100 == 0:
+            grads.flush()
+            index.flush()
 
     grads.flush()
     index.close()
