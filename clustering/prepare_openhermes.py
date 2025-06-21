@@ -48,12 +48,24 @@ def main(args):
     seq    = 0
 
     for prompt, answer in tqdm.tqdm(iter_docs(), desc="tokenise"):
-        enc = tok(prompt,
-                  text_target=answer,
-                  max_length=args.seqlen,
-                  truncation=True,
-                  padding='max_length',
-                  return_tensors="np")
+        prompt_ids  = tok(prompt)["input_ids"]
+        answer_ids  = tok(answer, add_special_tokens=False)["input_ids"] + [tok.eos_token_id]
+
+        # 1. Concatenate prompt + answer
+        input_ids   = prompt_ids + answer_ids
+
+        # 2. Copy to labels
+        labels      = input_ids.copy()
+
+        # 3. Mask prompt positions
+        labels[:len(prompt_ids)] = -100
+
+        # 4. Pad/truncate to fixed length
+        enc = tok.pad(
+            {"input_ids": input_ids, "labels": labels},
+            padding="max_length",
+            max_length=args.seqlen
+        )
 
         # labels have -100 wherever the token came from the prompt
         tokens  = enc["input_ids"][0].astype(np.int32)
