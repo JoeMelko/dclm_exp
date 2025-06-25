@@ -1,15 +1,14 @@
 1x baseline:
-Cross-entropy loss: 1.786163
-Perplexity       : 5.966514
+Cross-entropy loss: 1.793837
+Perplexity       : 6.012480
 
 3x baseline:
-Cross-entropy loss: 1.648927
-Perplexity       : 5.201395
+
 
 .75x top:
-Cross-entropy loss: 1.825467                                                                                                                                     
-Perplexity       : 6.205695 
+Cross-entropy loss: 1.825842
+Perplexity       : 6.208023 
 
 .75x bottom:
-Cross-entropy loss: 1.898375                                                                                                                                     
-Perplexity       : 6.675036                                                                                                                                      
+Cross-entropy loss: 1.909948
+Perplexity       : 6.752739                                                                                                                               
