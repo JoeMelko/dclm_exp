@@ -79,10 +79,10 @@ upper_maxcount = max(1, math.ceil(num_kept_samples / MAX_SHARDS))
 lower_maxcount = upper_maxcount
 
 writer_upper = wds.ShardWriter(
-    str(DEST_UPPER / "shard_%08d.tar"), maxcount=upper_maxcount, verbose=1
+    str(DEST_UPPER / "shard_%08d.tar"), maxcount=upper_maxcount, verbose=1, encoder=False
 )
 writer_lower = wds.ShardWriter(
-    str(DEST_LOWER / "shard_%08d.tar"), maxcount=lower_maxcount, verbose=1
+    str(DEST_LOWER / "shard_%08d.tar"), maxcount=lower_maxcount, verbose=1, encoder=False
 )
 
 # ---------------------------------------------------------------------------
