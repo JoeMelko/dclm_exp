@@ -115,6 +115,7 @@ def evaluate(model: torch.nn.Module,
              loader: torch.utils.data.DataLoader,
              device: torch.device) -> float:
     total_loss, total_tokens = 0.0, 0
+    tmp_loss, tmp_tokens = 0.0, 0
     ct = 0
     for toks, labels in tqdm.tqdm(loader, desc="Evaluating"):
         toks, labels = toks.to(device), labels.to(device)
@@ -124,8 +125,13 @@ def evaluate(model: torch.nn.Module,
         n_tokens = (labels != -100).sum().item()
         total_loss   += out.loss.item() * n_tokens
         total_tokens += n_tokens
+        tmp_loss += out.loss.item() * n_tokens
+        tmp_tokens += n_tokens
         ct += 1
-        if ct > 1000:
+        if ct % 500 == 0:
+            print(tmp_loss / tmp_tokens)
+            tmp_loss, tmp_tokens = 0.0, 0
+        if ct > 30000:
             break
     return total_loss / total_tokens
 

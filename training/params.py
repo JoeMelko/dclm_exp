@@ -208,6 +208,38 @@ def add_dcnlp_args(parser):
         default=0,
         help="This is the maximum number of failed checkpoints (due to not having seen enough tokens) that are allowed",
     )
+    parser.add_argument(
+        "--no-shard-shuffle",
+        action="store_true",
+        help="Whether to disable shard shuffle in the curriculum.",
+    )
+
+    # ------------------------------------------------------------------
+    # Document-level causal masking flags (forwarded to open_lm)
+    # ------------------------------------------------------------------
+    parser.add_argument(
+        "--doc-causal-mask",
+        action="store_true",
+        help="Enable document-aware causal mask (prevents attention across EOS tokens).",
+    )
+    parser.add_argument(
+        "--eos-token-id",
+        type=int,
+        default=0,
+        help="EOS token id used when --doc-causal-mask is active (forwarded to open_lm).",
+    )
+    parser.add_argument(
+        "--debug-doc-mask",
+        action="store_true",
+        help="If set, open_lm will drop into pdb after building the document-level mask (first batch).",
+    )
+
+    # Disable FSDP entirely (overrides scale config)
+    parser.add_argument(
+        "--disable-fsdp",
+        action="store_true",
+        help="Do not include any --fsdp flags even if they exist in the scale config.",
+    )
 
 
 def parse_dcnlp_args():
@@ -299,6 +331,14 @@ def get_open_lm_args(args, hparams, dr):
         f"{args.data_tolerate_num_ckpts}",
     ]
 
+    # Forward document-level causal mask flags
+    if args.doc_causal_mask:
+        open_lm_args.append("--doc-causal-mask")
+    # Always pass eos-token-id so open_lm has consistent default
+    open_lm_args.extend(["--eos-token-id", f"{args.eos_token_id}"])
+    if args.debug_doc_mask:
+        open_lm_args.append("--debug-doc-mask")
+
     if args.pretrained is not None:
         open_lm_args.extend(["--pretrained", f"{args.pretrained}"])
         if args.load_pretrained_state:
@@ -328,9 +368,9 @@ def get_open_lm_args(args, hparams, dr):
                 name,
             ]
         )
-        # add fsdp flags that are different for "smaller" and "larger" configs
-
-        open_lm_args.extend(hparams.fsdp_flags)
+        # add fsdp flags unless disabled by user
+        if not args.disable_fsdp:
+            open_lm_args.extend(hparams.fsdp_flags)
     else:
         # get name from the passed model.json
         model_json = None
@@ -447,5 +487,9 @@ def get_open_lm_args(args, hparams, dr):
         )
     if args.torchcompile:
         open_lm_args.append("--torchcompile")
+
+    # Forward curriculum flag to open_lm
+    if args.no_shard_shuffle:
+        open_lm_args.append("--no-shard-shuffle")
 
     return open_lm_args, name
