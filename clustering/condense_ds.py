@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, Iterator
 import random
+import shutil
 
 import zstandard as zstd
 
@@ -38,6 +39,11 @@ def jsonl_bytes_from_zstd(fp: Path) -> Iterator[bytes]:
     with fp.open("rb") as f, dctx.stream_reader(f) as reader:
         with io.TextIOWrapper(reader, encoding="utf-8") as text_reader:
             for line in text_reader:
+                # Ensure each emitted record ends with a newline so that adjacent
+                # shards never end up with two JSON objects stuck together when
+                # the *final* line of a shard lacks a trailing newline.
+                if not line.endswith("\n"):
+                    line += "\n"
                 yield line.encode("utf-8")
 
 
@@ -62,6 +68,7 @@ def condense_shards(
     c_level: int = 3,
     shuffle_shards: bool = False,
     shuffle_lines: bool = False,
+    overwrite_dir: bool = False,
 ) -> None:
     """
     Stream-decompress every shard in *input_dir* that matches *pattern* and write
@@ -69,10 +76,17 @@ def condense_shards(
     Zstandard level *c_level*).
     """
     if output_dir.exists():
-        raise SystemExit(
-            f"Output directory '{output_dir}' already exists – please supply a "
-            "NEW directory to guarantee the original shards stay untouched."
-        )
+        if overwrite_dir:
+            print(
+                f"⚠️  Output directory '{output_dir}' exists – removing it because --overwrite-dir was provided"
+            )
+            shutil.rmtree(output_dir)
+        else:
+            raise SystemExit(
+                f"Output directory '{output_dir}' already exists – please supply a "
+                "NEW directory to guarantee the original shards stay untouched, or pass --overwrite-dir to overwrite it."
+            )
+    # (Re-)create the output directory after potential removal
     output_dir.mkdir(parents=True)
 
     shards = list(enumerate_shards(input_dir, pattern))
@@ -162,6 +176,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "into memory, so use with care."
         ),
     )
+    p.add_argument(
+        "--overwrite-dir",
+        action="store_true",
+        help=(
+            "If the output directory already exists, delete it and overwrite its contents. "
+            "USE WITH CAUTION – this permanently removes the existing directory."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -177,6 +199,7 @@ def main(argv: list[str] | None = None) -> None:
         c_level=args.level,
         shuffle_shards=args.shuffle_shards,
         shuffle_lines=args.shuffle_lines,
+        overwrite_dir=args.overwrite_dir,
     )
 
 
