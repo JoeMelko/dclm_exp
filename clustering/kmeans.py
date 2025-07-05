@@ -3,10 +3,10 @@
 Cluster ~30M fp16 embeddings (1024‑D) into 10 k clusters with FAISS GPU K‑means
 and write a mapping row_id -> cluster_id (tab‑separated).
 
-  python kmeans40M.py \
-         --embeddings ../data/gs01_ls1/embeddings/datacomp_glob1_local1_qwen3_0.6B.npy \
+  python kmeans.py \
+         --embeddings embeddings/datacomp_glob1_local1_qwen3_0.6B.npy \
          --n-clusters 10000 \
-         --sample 3000000 \
+         --sample 10000000 \
          --out clusters.tsv
 """
 import argparse, os, time, numpy as np, faiss, torch, tqdm, matplotlib.pyplot as plt
@@ -44,7 +44,8 @@ def load_embeddings(path):
     ext = os.path.splitext(path)[1].lower()
 
     if ext in {".npy", ".npz"}:
-        arr = np.load(path, mmap_mode="r")
+        arr = np.asarray(np.load(path))
+        breakpoint()
         # np.load on .npz returns a dict-like object; grab the first array
         if not isinstance(arr, np.ndarray):
             key = list(arr.keys())[0]

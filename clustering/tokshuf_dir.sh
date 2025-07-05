@@ -95,11 +95,14 @@ echo
 running=0
 for ds in "${DATASET_DIRS[@]}"; do
   [[ -d "$ds" ]] || continue
-
+  echo "Running job before"
   run_one "$ds" &   # background job
+  echo "Running job after"
   ((running+=1))
+  echo "Running jobs: $running"
 
   if (( running >= WORKERS )); then
+    echo "Waiting for job to finish"
     wait -n          # Bash 4.3+: wait for any job to finish
     ((running-=1))
   fi

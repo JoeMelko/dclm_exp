@@ -9,9 +9,9 @@ a single `.npy` matrix whose rows exactly follow source order.
 Launch on one 8‑GPU node:
 
   torchrun --standalone --nproc_per_node 8 \
-      embed2.py \
-      --data_dir   /home/jmelko/dclm_exp/data/gs01_ls1 \
-      --out_dir    /home/jmelko/dclm_exp/data/gs01_ls1/embeddings \
+      clustering/embed2.py \
+      --data_dir   /mnt/one/home/jmelko/dclm_exp/data/gs01_ls1 \
+      --out_dir    /mnt/one/home/jmelko/dclm_exp/data/gs01_ls1/embeddings \
       --batch_size 64 \
       --max_len    1024
 """
