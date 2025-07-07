@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# launch_collect_features.sh
+# --------------------------
+# Convenience wrapper that
+#   1) pre-allocates the shared memmap (create_mmap_features.py) and then
+#   2) spawns *eight* parallel `collect_features_dc.py` instances – one per GPU –
+#      such that each process writes to a disjoint slice of the mmap without
+#      overlap.
+#
+# The CLI closely mirrors `launch_collect_grads.sh` so you can reuse most flags.
+# Unknown flags are forwarded to **both** the mmap-creation step and the worker
+# processes.
+#
+# Example
+#   ./launch_collect_features.sh \
+#       --wds-dir /data/tokenised_wds \
+#       --uuid 123e4567-e89b-12d3-a456-426614174000 \
+#       --shards-per-gpu 15 \
+#       --shard-size 1000 \
+#       --out clustering/mgd/features.fp16
+#
+# Any flag accepted by create_mmap_features.py / collect_features_dc.py may be
+# specified here (e.g. --lora-rank, --num-blocks, --out, ...).
+
+set -euo pipefail
+
+# ------------- default parameters ------------- #
+GPU_COUNT=8
+SHARDS_PER_GPU=15      # aka chunk-size
+SHARD_SIZE=1000        # samples per shard (placeholder default)
+TOTAL_SHARDS=$((GPU_COUNT*SHARDS_PER_GPU))
+EXTRA_ARGS=()
+CUSTOM_TOTAL_SHARDS=0
+
+# ------------- CLI parsing -------------------- #
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --shards-per-gpu|--chunk-size)
+            SHARDS_PER_GPU="$2"; shift 2;;
+        --shard-size)
+            SHARD_SIZE="$2"; shift 2;;
+        --num-shards)
+            TOTAL_SHARDS="$2"; CUSTOM_TOTAL_SHARDS=1; shift 2;;
+        *)
+            EXTRA_ARGS+=("$1"); shift;;
+    esac
+done
+
+# recompute total shards only if the user did NOT supply --num-shards explicitly
+if [[ "$CUSTOM_TOTAL_SHARDS" -eq 0 ]]; then
+    TOTAL_SHARDS=$((GPU_COUNT*SHARDS_PER_GPU))
+fi
+
+# ------------- run create_mmap_features.py ------------- #
+python create_mmap_features.py \
+    --num-shards "$TOTAL_SHARDS" \
+    --shard-size "$SHARD_SIZE" \
+    "${EXTRA_ARGS[@]}"
+
+echo "[launcher] Memmap initialised – spawning $GPU_COUNT GPU workers (chunk $SHARDS_PER_GPU)"
+
+# ------------- spawn workers ------------------ #
+for GPU_ID in $(seq 0 $((GPU_COUNT-1))); do
+    echo "[launcher] GPU $GPU_ID → shards chunk-size $SHARDS_PER_GPU"
+    START_OFFSET=$((GPU_ID * SHARDS_PER_GPU * SHARD_SIZE))
+
+    CUDA_VISIBLE_DEVICES="$GPU_ID" \
+    python mgd/collect_features_dc.py \
+        --gpu-id "$GPU_ID" \
+        --total-gpus "$GPU_COUNT" \
+        --chunk-size "$SHARDS_PER_GPU" \
+        --num-shards "$TOTAL_SHARDS" \
+        --shard-size "$SHARD_SIZE" \
+        --start-offset "$START_OFFSET" \
+        "${EXTRA_ARGS[@]}" &
+
+done
+
+wait
+echo "[launcher] All workers finished." 
