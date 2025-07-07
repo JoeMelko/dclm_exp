@@ -8,13 +8,13 @@ Iterate over a *tokenised* WebDataset consisting of ``*.json.gz`` samples that
 contain ``{"tokens": [...]}`` and, for every batch
 (1) compute per-example gradient features via LoRA's `Logger`,
 (2) average the features across the batch,
-(3) compute the cosine similarity against a **reference vector** provided on the
+(3) compute the cosine similarity against a **target vector** provided on the
     command line, and
 (4) store all similarities in a single ``.npy`` file named
     ``{<wds_dir-basename>}_iter_{<iter>}.npy``.
 
 Only minimal changes compared to ``collect_grads_dc.py``:
-* new CLI flag ``--ref-vector`` – path to ``.npy`` containing a 1-D reference
+* new CLI flag ``--target-vector`` – path to ``.npy`` containing a 1-D target
   vector of shape ``(num_blocks * lora_rank,)``
 * new CLI flag ``--iter`` with default ``0`` – controls output file name
 * instead of writing raw gradients, the script collects cosine similarities.
@@ -44,7 +44,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 # -------------------- configuration -------------------- #
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 # ------------------------------------------------------- #
 
 # --- optional: only needed when you use --uuid -----------------------------
@@ -203,13 +203,13 @@ def main(args):
     model, handler, logger = prepare_model(get_model(args), args)
 
     # -------------------------------------------------------------------
-    # Load reference vector and whitener matrices **onto the GPU** so that
+    # Load target vector and whitener matrices **onto the GPU** so that
     # all subsequent computations stay on device until the very end.
     # -------------------------------------------------------------------
     device_t = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ref_vec = (
-        torch.from_numpy(np.load(args.ref_vector).astype(np.float32))
+    target_vec = (
+        torch.from_numpy(np.load(args.target_vector).astype(np.float32))
         .to(device_t)
         .view(-1)
     )  # already whitened + L2-normalised
@@ -272,7 +272,7 @@ def main(args):
         # Per-sample processing (no batch average)
         # 1. Rearrange to (batch, num_blocks, rank)
         # 2. Whiten each sample's (num_blocks, rank) features → (num_blocks, rank)
-        # 3. Flatten, compute dot-product with ref_vec, and its L2-norm.
+        # 3. Flatten, compute dot-product with target_vec, and its L2-norm.
         # ------------------------------------------------------------------
 
         feats_per_sample = features.permute(1, 0, 2)  # (batch, B, d)
@@ -289,19 +289,22 @@ def main(args):
         # Flatten → (batch, B*d)
         whitened_vecs = whitened_blocks.reshape(whitened_blocks.size(0), -1)
 
-        if whitened_vecs.shape[1] != ref_vec.numel():
+        if whitened_vecs.shape[1] != target_vec.numel():
             raise ValueError(
-                f"Reference vector length {ref_vec.numel()} != whitened feature length {whitened_vecs.shape[1]}"
+                f"Target vector length {target_vec.numel()} != whitened feature length {whitened_vecs.shape[1]}"
             )
 
-        # Dot product (non-normalised) with reference vector
-        dots = torch.matmul(whitened_vecs, ref_vec)  # (batch,)
+        # Dot product (non-normalised) with target vector
+        dots = torch.matmul(whitened_vecs, target_vec)  # (batch,)
 
         # L2 norm of each flattened (whitened) grad
         norms = torch.linalg.norm(whitened_vecs, dim=1)  # (batch,)
 
         dot_products_gpu.append(dots)
         l2_norms_gpu.append(norms)
+        if len(l2_norms_gpu) > 500:
+            # dont waste compute on massive clusters
+            break
 
     # Concatenate results, move to CPU once, convert to NumPy
     dot_products = torch.cat(dot_products_gpu).cpu().numpy().astype(np.float32)
@@ -323,7 +326,7 @@ def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--wds-dir", required=True, help="directory with tokenised WebDataset shards")
-    ap.add_argument("--ref-vector", required=True, help="path to .npy containing reference vector")
+    ap.add_argument("--target-vector", required=True, help="path to .npy containing flattened target vector (already whitened + L2-normalised)")
     ap.add_argument("--uuid", help="Datacomp-LM run UUID (overrides --ckpt)")
     ap.add_argument("--ckpt", help="HuggingFace checkpoint path or Hub ID")
     ap.add_argument("--iter", type=int, default=0, help="iteration index used in output file name")

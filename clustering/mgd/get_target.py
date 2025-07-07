@@ -6,7 +6,7 @@ For the assigned GPU worker, iterate over a contiguous **chunk** of WebDataset
 shards, accumulate the LoRA-projected per-token gradients ("target vectors"),
 and write their FP32 sum to:
 
-    ``{OUT_DIR}/dir_{gpu_id}/sum.npy``
+    ``{OUT_DIR}/sum_{gpu_id}.npy``
 
 Typical single-worker invocation::
 
@@ -284,10 +284,10 @@ def main(args):
         sum_feats += batch_sum
         logger.grads.zero_()
 
-    # Save the accumulated sum to its designated directory
-    out_dir = Path(args.out_dir) / f"dir_{args.gpu_id}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    np.save(out_dir / "sum.npy", sum_feats.astype(np.float32))
+    # Save the accumulated sum for this GPU to `{OUT_DIR}/sum_{gpu_id}.npy`
+    out_path = Path(args.out_dir) / f"sum_{args.gpu_id}.npy"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(out_path, sum_feats.astype(np.float32))
 
 
 if __name__ == "__main__":

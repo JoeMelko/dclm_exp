@@ -2,14 +2,15 @@
 """
 condition.py
 -------------
-Aggregate the per-GPU target direction vectors written by ``launch_get_target.sh``
-and post-process them so that they can be used as a *whitened* optimisation
-condition.
+Aggregate the per-GPU target direction vectors produced by ``launch_get_target.sh``
+(``get_target.py`` workers).  Each GPU now writes its partial sum to a common
+directory as ``sum_{gpu_id}.npy``.  This script loads all those files,
+aggregates them, and applies block-wise whitening so the result can serve as a
+normalised optimisation *condition*.
 
 Workflow
 ========
-1. Load ``dir_0/sum.npy … dir_{N-1}/sum.npy`` (see ``get_target.py``) and sum
-   them in float32.
+1. Load ``sum_0.npy … sum_{N-1}.npy`` and sum them in float32.
 2. Load the inverse Fisher square-root matrices produced by ``hessian.py``
    (``--whiteners-path``).
 3. Whiten the aggregate target by multiplying every block vector ``v₍b₎`` with
@@ -62,7 +63,7 @@ def load_and_sum_targets(root: Path, num_gpus: int) -> np.ndarray:
     agg: np.ndarray | None = None
 
     for gpu_id in range(num_gpus):
-        vec_path = root / f"dir_{gpu_id}" / "sum.npy"
+        vec_path = root / f"sum_{gpu_id}.npy"
         if not vec_path.exists():
             raise FileNotFoundError(f"Missing per-GPU file: {vec_path}")
         vec = np.load(vec_path, mmap_mode=None).astype(np.float32)

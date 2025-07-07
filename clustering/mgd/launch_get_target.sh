@@ -4,7 +4,7 @@
 # Spawns one `get_target.py` worker per GPU (default: 8) to accumulate
 # per-example gradients / target vectors from a tokenised WebDataset.
 # Each worker processes a contiguous chunk (`--chunk-size`) of shards and
-# writes its partial sum to `dir_{gpu_id}/sum.npy`. This corresponds to
+# writes its partial sum to `{out-dir}/sum_{gpu_id}.npy`. This corresponds to
 # *Stage 3* of the MGD workflow described in `README.md`.
 #
 # Example:
