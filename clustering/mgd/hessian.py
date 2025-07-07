@@ -140,7 +140,7 @@ def main() -> None:
         print(f"Saved gradient norms with shape {grad_norms.shape} to {norms_path}")
 
     # Re-arrange for block-wise processing: (B, N, d)
-    grads = grads_cpu.permute(1, 0, 2).contiguous()
+    grads = grads_cpu.permute(1, 0, 2)
 
     # Free temporary tensors
     del scaling
@@ -158,13 +158,10 @@ def main() -> None:
     eye_gpu = torch.eye(d, dtype=torch.float32, device=device)
 
     for b in tqdm(range(B)):
-        if args.verbose:
-            print(f"Processing block {b}/{B-1}")
 
         X_cpu = grads[b]                            # (N, d) on CPU
-        X = X_cpu.to(device, non_blocking=True)     # move to GPU
+        X = X_cpu.to(device)     # move to GPU
 
-        X /= math.sqrt(N)                           # normalise by sqrt(N)
         F = X.T @ X                                 # Fisher block (d,d)
 
         # Eigenvalues for ridge calculation
@@ -186,16 +183,15 @@ def main() -> None:
 
         whiteners[b] = inv_sqrt.to(torch.float32).cpu()
 
-        # Cleanup GPU memory
-        del X, F, F_reg, F_inv, evals, evecs, inv_sqrt, w
-        torch.cuda.empty_cache() if device.type == "cuda" else None
-
         if args.verbose:
             cond_before = w_max / w_min
             cond_after = torch.linalg.cond(F_reg)
             print(
                 f"Block {b:>3d}: λ={lam:.3e}  cond_before={cond_before:.3e}  cond_after={cond_after:.3e}"
             )
+        # Cleanup GPU memory
+        del X, F, F_reg, F_inv, evals, evecs, inv_sqrt, w
+        torch.cuda.empty_cache() if device.type == "cuda" else None
 
     # ----------------------------
     #   3. Save whitener matrices
