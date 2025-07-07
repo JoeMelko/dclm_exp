@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
-# launch_collect_grads.sh
-# -----------------------
-# One-stop helper to (1) allocate the shared mem-map once and (2) spawn
-# eight parallel `collect_grads.py` instances – one per GPU.
+# launch_get_target.sh
+# --------------------
+# Spawns one `get_target.py` worker per GPU (default: 8) to accumulate
+# per-example gradients / target vectors from a tokenised WebDataset.
+# Each worker processes a contiguous chunk (`--chunk-size`) of shards and
+# writes its partial sum to `dir_{gpu_id}/sum.npy`. This corresponds to
+# *Stage 3* of the MGD workflow described in `README.md`.
 #
 # Example:
-#   ./launch_collect_grads.sh \
+#   ./launch_get_target.sh \
 #       --wds-dir /data/tokenised_wds \
 #       --uuid 123e4567-e89b-12d3-a456-426614174000 \
-#       --shards-per-gpu 15
+#       --chunk-size 15 \
+#       --shard-size 1000 \
+#       --lora-rank 128 \
+#       --num-blocks 8 \
+#       --out-dir clustering/mgd/targets
 #
-# The script forwards all unknown flags to both the mmap-creation step and the
-# worker processes so you can reuse `--out`, `--index`, `--lora-rank`, …
+# The script forwards all unknown flags directly to every `get_target.py`
+# worker so you can reuse common options such as `--lora-rank`, `--num-blocks`, …
 set -euo pipefail
 
 # ------------- default parameters ------------- #
@@ -19,6 +26,7 @@ GPU_COUNT=8
 SHARDS_PER_GPU=15       # aka chunk-size
 SHARD_SIZE=1000         # samples per shard (placeholder default)
 TOTAL_SHARDS=$((GPU_COUNT*SHARDS_PER_GPU))
+OUT_DIR="clustering/mgd/targets"
 EXTRA_ARGS=()
 CUSTOM_TOTAL_SHARDS=0
 
@@ -29,6 +37,8 @@ while [[ $# -gt 0 ]]; do
             SHARDS_PER_GPU="$2"; shift 2;;
         --shard-size)
             SHARD_SIZE="$2"; shift 2;;
+        --out-dir)
+            OUT_DIR="$2"; shift 2;;
         --num-shards)
             TOTAL_SHARDS="$2"; CUSTOM_TOTAL_SHARDS=1; shift 2;;
         *)
@@ -55,6 +65,7 @@ for GPU_ID in $(seq 0 $((GPU_COUNT-1))); do
         --num-shards "$TOTAL_SHARDS" \
         --shard-size "$SHARD_SIZE" \
         --start-offset "$START_OFFSET" \
+        --out-dir "$OUT_DIR" \
         "${EXTRA_ARGS[@]}" &
 done
 

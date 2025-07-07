@@ -1,10 +1,25 @@
 #!/usr/bin/env python
 """
-collect_grads.py
-----------------
-Iterate over a *tokenised* WebDataset (tokens.npy / labels.npy) and save
-per-example gradients dL/dW for the model's ``lm_head.weight`` at a fixed 400 M
-checkpoint.
+get_target.py  –  Multi-GPU clustering *Stage 3*
+------------------------------------------------
+For the assigned GPU worker, iterate over a contiguous **chunk** of WebDataset
+shards, accumulate the LoRA-projected per-token gradients ("target vectors"),
+and write their FP32 sum to:
+
+    ``{OUT_DIR}/dir_{gpu_id}/sum.npy``
+
+Typical single-worker invocation::
+
+    python get_target.py \
+        --wds-dir /data/tokenised_wds \
+        --uuid 123e4567-e89b-12d3-a456-426614174000 \
+        --gpu-id 0 --total-gpus 8 \
+        --chunk-size 15 --shard-size 1000 --num-shards 120 \
+        --lora-rank 128 --num-blocks 8 \
+        --out-dir clustering/mgd/targets
+
+All arguments (except ``--uuid`` / ``--ckpt``) are typically supplied by
+``launch_get_target.sh``.
 
 Two loading modes
 -----------------
@@ -35,13 +50,24 @@ os.environ["XFORMERS_DISABLE_SWIGLU"] = "1"
 import numpy as np
 import torch, tqdm, webdataset as wds
 from transformers import AutoModelForCausalLM
-from lora.lora import LoRAHandler
-from lora.logger import Logger
 from torch.cuda.amp import GradScaler
 from transformers import AutoTokenizer
 from open_lm.utils.transformers.hf_model import OpenLMforCausalLM
 from open_lm.main import load_model
 import io
+import sys
+
+# Ensure the sibling `lora` package (dclm_exp/clustering/lora) is importable before
+# attempting to import it.  Append the parent directory of the current package
+# (`dclm_exp/clustering`) to `sys.path` if it is not already present.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent  # dclm_exp/clustering
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Import LoRA utilities *after* the path patch so the `lora` package is
+# resolvable when this script is executed directly.
+from lora.lora import LoRAHandler
+from lora.logger import Logger
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -89,7 +115,8 @@ def load_openlm_model_from_uuid(run_uuid: str):
     # ------------------------------------------------------------------
     # 1) locate the metadata JSON describing the run
     # ------------------------------------------------------------------
-    project_root = Path(__file__).resolve().parent.parent  # dclm_exp/
+    # Resolve project root two directories above 'clustering' -> 'dclm_exp/'
+    project_root = Path(__file__).resolve().parent.parent.parent  # dclm_exp/
     exp_root = project_root / "exp_data" / "models"
     meta_path = next(exp_root.rglob(f"*{run_uuid}*.json"), None)
     if meta_path is None:
@@ -258,7 +285,7 @@ def main(args):
         logger.grads.zero_()
 
     # Save the accumulated sum to its designated directory
-    out_dir = Path(f"dir_{args.gpu_id}")
+    out_dir = Path(args.out_dir) / f"dir_{args.gpu_id}"
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / "sum.npy", sum_feats.astype(np.float32))
 
@@ -271,12 +298,8 @@ if __name__ == "__main__":
                     help = "Datacomp-LM run UUID (overrides --ckpt)")
     ap.add_argument("--ckpt",
                     help = "HuggingFace checkpoint path or Hub ID")
-    ap.add_argument("--out",   default = "clustering/openhermes_feats/grads.fp16_mul_1024",
-                    help = "output memmap filename")
-    ap.add_argument("--trainables-out", default = "clustering/openhermes_feats/num_trainables.int32",
-                    help = "output mmap filename for per-sample token counts")
-    ap.add_argument("--index", default = "clustering/openhermes_feats/index.tsv",
-                    help = "tsv mapping row_id → sample key")
+    ap.add_argument("--out-dir", default = "clustering/mgd/targets",
+                    help = "output directory for target vectors")
     ap.add_argument("--lora-rank", type=int, default=128,
                     help = "LORA rank")
     ap.add_argument("--num-blocks", type=int, default=8,
