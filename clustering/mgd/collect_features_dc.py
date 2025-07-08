@@ -227,12 +227,18 @@ def main(args):
         raise FileNotFoundError(f"No .tar shards found in {wds_dir_path}")
 
     # ---------------- shard selection: multi-GPU ----------------
-    selected_indices = [args.chunk_size * args.gpu_id : (args.chunk_size * (args.gpu_id + 1))]
-    if not selected_indices:
+    # Each GPU processes a contiguous slice of `tar_files` determined by its id.
+    start_idx = args.chunk_size * args.gpu_id
+    end_idx   = args.chunk_size * (args.gpu_id + 1)
+
+    # Guard against overshooting the number of available shards.
+    if start_idx >= len(tar_files):
         raise RuntimeError(
             f"GPU {args.gpu_id} received no shards – check --chunk-size and --total-gpus"
         )
-    selected_files = [tar_files[i] for i in selected_indices]
+
+    selected_indices = range(start_idx, min(end_idx, len(tar_files)))
+    selected_files   = [tar_files[i] for i in selected_indices]
 
     ds = wds.WebDataset([str(p) for p in selected_files])
     # Use a single worker to preserve exact sample order → deterministic index
@@ -307,6 +313,10 @@ if __name__ == "__main__":
                     help="number of samples per shard")
     ap.add_argument("--start-offset", type=int, required=True,
                     help="row offset in the mmap where this worker starts writing")
+
+    # Number of background WebDataset loader workers (0 = main process only).
+    ap.add_argument("--workers", type=int, default=0,
+                    help="Number of subprocess workers for WebDataset loader (default: 0).")
 
     args = ap.parse_args()
 

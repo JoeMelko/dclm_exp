@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Compute block-wise regularised inverse-Fisher square-root ("whitener") matrices for a set of
+Compute block-wise regularised Fisher (Hessian) matrices for a set of
 projected gradients stored in a memory-mapped file.
 
 Pipeline
@@ -13,9 +13,9 @@ Pipeline
 4. For each block `b = 0 … 2*num_blocks-1`:
    a. Form the Fisher block `F_b = X_bᵀ X_b / N` on the GPU.
    b. Add a diagonal ridge `λ I` such that `cond(F_b + λ I) == --cond`.
-   c. Invert and take the inverse square root `F_b^{-1/2}` (the whitener).
-   d. Store the result on CPU and release GPU memory before the next block.
-5. Save the stacked whiteners to `--out-path` with shape
+   c. Add the ridge and store the regularised Fisher block `\tilde{F}_b = F_b + \lambda I` on CPU.
+   d. Release GPU memory before processing the next block.
+5. Save the stacked Hessian blocks to `--out-path` with shape
    `(2*num_blocks, rank*rank, rank*rank)` (float32).
 6. Save the per-sample norm vector via `--norms-path` (default `<out-path>_norms.npy`).
 
@@ -43,7 +43,7 @@ from tqdm import tqdm
 import torch
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Compute inverse Fisher blocks from gradient memmap.")
+    p = argparse.ArgumentParser(description="Compute regularised Fisher (Hessian) blocks from gradient memmap.")
     p.add_argument("--mmap-path", type=str, required=True,
                    help="Path to the memory‑mapped file produced during gradient collection.")
     p.add_argument("--rank", type=int, default=128,
@@ -146,14 +146,14 @@ def main() -> None:
     del scaling
 
     # ----------------------------
-    #   2. Compute Fisher inverse square roots (whiteners)
+    #   2. Compute regularised Fisher (Hessian) blocks
     # ----------------------------
 
-    whiteners = torch.empty((B, d, d), dtype=torch.float32)
+    hessians = torch.empty((B, d, d), dtype=torch.float32)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.verbose:
-        print(f"Using device {device} for Fisher inversion.")
+        print(f"Using device {device} for Fisher (Hessian) computation.")
 
     eye_gpu = torch.eye(d, dtype=torch.float32, device=device)
 
@@ -177,11 +177,8 @@ def main() -> None:
 
         F_reg = F + lam * eye_gpu
 
-        F_inv = torch.linalg.inv(F_reg)
-        evals, evecs = torch.linalg.eigh(F_inv)
-        inv_sqrt = (evecs * evals.sqrt().unsqueeze(0)) @ evecs.T  # F^{-1/2}
-
-        whiteners[b] = inv_sqrt.to(torch.float32).cpu()
+        # Store the regularised Fisher block (Hessian)
+        hessians[b] = F_reg.to(torch.float32).cpu()
 
         if args.verbose:
             cond_before = w_max / w_min
@@ -190,16 +187,16 @@ def main() -> None:
                 f"Block {b:>3d}: λ={lam:.3e}  cond_before={cond_before:.3e}  cond_after={cond_after:.3e}"
             )
         # Cleanup GPU memory
-        del X, F, F_reg, F_inv, evals, evecs, inv_sqrt, w
+        del X, F, F_reg, w
         torch.cuda.empty_cache() if device.type == "cuda" else None
 
     # ----------------------------
-    #   3. Save whitener matrices
+    #   3. Save Hessian matrices
     # ----------------------------
 
-    np.save(args.out_path, whiteners.numpy())
+    np.save(args.out_path, hessians.numpy())
     if args.verbose:
-        print(f"Saved whitener matrices with shape {whiteners.shape} to {args.out_path}")
+        print(f"Saved Hessian matrices with shape {hessians.shape} to {args.out_path}")
 
 
 if __name__ == "__main__":

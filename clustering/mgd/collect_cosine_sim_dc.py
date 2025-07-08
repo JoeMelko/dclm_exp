@@ -15,9 +15,14 @@ contain ``{"tokens": [...]}`` and, for every batch
 
 Only minimal changes compared to ``collect_grads_dc.py``:
 * new CLI flag ``--target-vector`` – path to ``.npy`` containing a 1-D target
-  vector of shape ``(num_blocks * lora_rank,)``
+  vector of shape ``(num_blocks * lora_rank,)`` **that has already been
+  whitened and L2-normalised**.
 * new CLI flag ``--iter`` with default ``0`` – controls output file name
-* instead of writing raw gradients, the script collects cosine similarities.
+* compared to ``collect_grads_dc.py`` we now collect per-sample cosine
+  similarities rather than raw gradients.
+* NOTE: The previous ``--whiteners`` argument has been removed – the target
+  vector is assumed to be in the same feature space as the gradients, so
+  no additional whitening is performed at runtime.
 """
 # ──────────────────────────────────────────────────────────────────────────
 import argparse, json, gzip, io, sys
@@ -214,14 +219,18 @@ def main(args):
         .view(-1)
     )  # already whitened + L2-normalised
 
-    # Whitener matrices from hessian.py – shape: (num_blocks, rank, rank)
-    whiteners_np = np.load(args.whiteners).astype(np.float32)
-    B, d, d2 = whiteners_np.shape
-    if d != d2:
+    # Ensure the target vector length matches the expected feature dimension
+    # given by ``num_blocks * lora_rank`` supplied on the command line. No
+    # runtime whitening is required because both the gradients and the target
+    # vector are assumed to be **already** whitened and live in the same
+    # feature space.
+
+    expected_dim = 2 * args.num_blocks * args.lora_rank * args.lora_rank
+    if target_vec.numel() != expected_dim:
         raise ValueError(
-            f"Whitener matrices must be square; got shape {whiteners_np.shape}."
+            f"Target vector length {target_vec.numel()} does not equal the "
+            f"expected dimension {args.num_blocks} * {args.lora_rank} = {expected_dim}."
         )
-    whiteners = torch.from_numpy(whiteners_np).to(device_t)  # (B, d, d)
 
     # dataset
     wds_dir_path = Path(args.wds_dir)
@@ -271,34 +280,33 @@ def main(args):
         # ------------------------------------------------------------------
         # Per-sample processing (no batch average)
         # 1. Rearrange to (batch, num_blocks, rank)
-        # 2. Whiten each sample's (num_blocks, rank) features → (num_blocks, rank)
-        # 3. Flatten, compute dot-product with target_vec, and its L2-norm.
+        # 2. Flatten gradient features  → (batch, num_blocks * rank)
+        # 3. Dot product with target vector, and its L2-norm.
         # ------------------------------------------------------------------
 
         feats_per_sample = features.permute(1, 0, 2)  # (batch, B, d)
 
-        if feats_per_sample.shape[1] != B or feats_per_sample.shape[2] != d:
+        # Basic sanity-check: gradient tensor should have the configured
+        # num_blocks × lora_rank shape.
+        if feats_per_sample.shape[1] != 2 * args.num_blocks or feats_per_sample.shape[2] != args.lora_rank * args.lora_rank:
             raise ValueError(
-                f"Features shape {tuple(feats_per_sample.shape)} incompatible with whitener shape {(B, d)}"
+                f"Unexpected feature shape {tuple(feats_per_sample.shape)} – "
+                f"expected (*, {2 * args.num_blocks}, {args.lora_rank * args.lora_rank})."
             )
 
-        # Whiten all samples in a vectorised fashion:
-        #   (B, d, d) × (batch, B, d)  →  (batch, B, d)
-        whitened_blocks = torch.einsum("bij,sbj->sbi", whiteners, feats_per_sample)
+        # Flatten gradient features  → (batch, num_blocks * rank)
+        flat_feats = feats_per_sample.reshape(feats_per_sample.size(0), -1)
 
-        # Flatten → (batch, B*d)
-        whitened_vecs = whitened_blocks.reshape(whitened_blocks.size(0), -1)
-
-        if whitened_vecs.shape[1] != target_vec.numel():
+        if flat_feats.shape[1] != target_vec.numel():
             raise ValueError(
-                f"Target vector length {target_vec.numel()} != whitened feature length {whitened_vecs.shape[1]}"
+                f"Target vector length {target_vec.numel()} != gradient feature length {flat_feats.shape[1]}"
             )
 
         # Dot product (non-normalised) with target vector
-        dots = torch.matmul(whitened_vecs, target_vec)  # (batch,)
+        dots = torch.matmul(flat_feats, target_vec)  # (batch,)
 
-        # L2 norm of each flattened (whitened) grad
-        norms = torch.linalg.norm(whitened_vecs, dim=1)  # (batch,)
+        # L2 norm of each flattened grad
+        norms = torch.linalg.norm(flat_feats, dim=1)  # (batch,)
 
         dot_products_gpu.append(dots)
         l2_norms_gpu.append(norms)
@@ -332,7 +340,6 @@ if __name__ == "__main__":
     ap.add_argument("--iter", type=int, default=0, help="iteration index used in output file name")
     ap.add_argument("--lora-rank", type=int, default=128)
     ap.add_argument("--num-blocks", type=int, default=8)
-    ap.add_argument("--whiteners", required=True, help="Path to .npy containing whitener matrices from hessian.py")
     ap.add_argument("--out-dir", default="clustering/mgd", help="Directory where output .npy will be written (default: clustering/mgd/)")
     args = ap.parse_args()
 
