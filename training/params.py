@@ -223,12 +223,6 @@ def add_dcnlp_args(parser):
         help="Enable document-aware causal mask (prevents attention across EOS tokens).",
     )
     parser.add_argument(
-        "--eos-token-id",
-        type=int,
-        default=0,
-        help="EOS token id used when --doc-causal-mask is active (forwarded to open_lm).",
-    )
-    parser.add_argument(
         "--debug-doc-mask",
         action="store_true",
         help="If set, open_lm will drop into pdb after building the document-level mask (first batch).",
@@ -239,6 +233,12 @@ def add_dcnlp_args(parser):
         "--disable-fsdp",
         action="store_true",
         help="Do not include any --fsdp flags even if they exist in the scale config.",
+    )
+
+    parser.add_argument(
+        "--keep-previous-checkpoints",
+        action="store_true",
+        help="If set, do not delete previous checkpoints during training (omit --delete-previous-checkpoint flag).",
     )
 
 
@@ -331,13 +331,6 @@ def get_open_lm_args(args, hparams, dr):
         f"{args.data_tolerate_num_ckpts}",
     ]
 
-    # Forward document-level causal mask flags
-    if args.doc_causal_mask:
-        open_lm_args.append("--doc-causal-mask")
-    # Always pass eos-token-id so open_lm has consistent default
-    open_lm_args.extend(["--eos-token-id", f"{args.eos_token_id}"])
-    if args.debug_doc_mask:
-        open_lm_args.append("--debug-doc-mask")
 
     if args.pretrained is not None:
         open_lm_args.extend(["--pretrained", f"{args.pretrained}"])
@@ -491,5 +484,8 @@ def get_open_lm_args(args, hparams, dr):
     # Forward curriculum flag to open_lm
     if args.no_shard_shuffle:
         open_lm_args.append("--no-shard-shuffle")
+
+    if args.keep_previous_checkpoints and "--delete-previous-checkpoint" in open_lm_args:
+        open_lm_args.remove("--delete-previous-checkpoint")
 
     return open_lm_args, name
