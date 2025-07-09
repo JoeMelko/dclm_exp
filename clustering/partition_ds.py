@@ -16,6 +16,23 @@ The final result is **two new datasets** residing in sibling directories
 start a new output tar file after a calculated number of samples.  That
 threshold is chosen such that, given the number of samples, the writer
 will produce at most 400 files.
+
+Usage
+-----
+Basic invocation (uses defaults):
+
+    python partition_ds.py
+
+Override any of the paths or sample-per-shard limit:
+
+    python partition_ds.py \
+        --source-dir /path/to/shards \
+        --keep-path  /path/to/sorted_keep.npy \
+        --output-dir /path/for/output \
+        --max-shards 300
+
+All flags are optional; omitted options fall back to the defaults shown in
+the *Configuration* section below.
 """
 
 from collections import defaultdict
@@ -24,29 +41,58 @@ import math
 import numpy as np
 import webdataset as wds
 from tqdm import tqdm
+import argparse
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Location of the 800 processed shards
-SOURCE_DIR = Path(
-    "/home/jmelko/dclm_exp/rust_processing/tokshuf-rs/dclm_tokshuf"
+# Default values – can be overridden via CLI flags
+DEFAULT_SOURCE_DIR = Path("/home/jmelko/dclm_exp/rust_processing/tokshuf-rs/dclm_tokshuf")
+DEFAULT_KEEP_PATH = Path(__file__).parent / "score" / "sorted_keep.npy"
+DEFAULT_OUTPUT_DIR = Path(__file__).parent
+DEFAULT_MAX_SHARDS = 480
+
+parser = argparse.ArgumentParser(
+    description="Partition WebDataset shards into upper/lower subsets based on a keep-array."
+)
+parser.add_argument(
+    "--source-dir",
+    type=Path,
+    default=DEFAULT_SOURCE_DIR,
+    help="Directory containing the input shards (*.tar).",
+)
+parser.add_argument(
+    "--keep-path",
+    type=Path,
+    default=DEFAULT_KEEP_PATH,
+    help="Path to the sorted_keep.npy file listing kept samples.",
+)
+parser.add_argument(
+    "--output-dir",
+    type=Path,
+    default=DEFAULT_OUTPUT_DIR,
+    help="Base directory where subset_upper and subset_lower will be created.",
+)
+parser.add_argument(
+    "--max-shards",
+    type=int,
+    default=DEFAULT_MAX_SHARDS,
+    help="Maximum number of output shards per dataset.",
 )
 
-# Path to **sorted** keep-array (shape = [N_kept, 2])
-KEEP_PATH = Path(__file__).parent / "score" / "sorted_keep.npy"
+args = parser.parse_args()
 
-# Destination directories for the two new datasets
-DEST_UPPER = Path(__file__).parent / "subset_upper"
-DEST_LOWER = Path(__file__).parent / "subset_lower"
+# Resolved configuration after CLI parsing
+SOURCE_DIR: Path = args.source_dir
+KEEP_PATH: Path = args.keep_path
+DEST_UPPER: Path = args.output_dir / "subset_upper"
+DEST_LOWER: Path = args.output_dir / "subset_lower"
+MAX_SHARDS: int = args.max_shards
 
 # Ensure destination directories exist
 DEST_UPPER.mkdir(parents=True, exist_ok=True)
 DEST_LOWER.mkdir(parents=True, exist_ok=True)
-
-# Maximum number of output shards **per** dataset.  We want 400 each.
-MAX_SHARDS = 400
 
 # ---------------------------------------------------------------------------
 # Load and organise the "keep" list
@@ -89,7 +135,7 @@ writer_lower = wds.ShardWriter(
 # Iterate over shards one by one and write samples to the appropriate writer
 # ---------------------------------------------------------------------------
 
-for shard_id in tqdm(range(800)):
+for shard_id in tqdm(range(960)):
     shard_path = SOURCE_DIR / f"shard_{shard_id:08d}.tar"
     if not shard_path.exists():
         print(f"[WARN] Expected shard {shard_path} not found – skipping")
