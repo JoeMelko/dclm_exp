@@ -263,7 +263,22 @@ def assemble_dataset(
         # ShardWriter takes a dict-like sample; we *must* ensure keys are bytes
         sink.write(sample)
     sink.close()
-    print(f"✅  Wrote {len(order):,} samples to {out_dir}")
+
+    # Step D – write manifest.jsonl describing the new shards
+    total_samples = len(order)
+    num_full, remainder = divmod(total_samples, maxcount)
+    shard_counts = [maxcount] * num_full
+    if remainder:
+        shard_counts.append(remainder)
+
+    manifest_out = out_dir / "manifest.jsonl"
+    with manifest_out.open("w", encoding="utf-8") as mf:
+        for i, count in enumerate(shard_counts):
+            shard_name = f"shard_{i:08d}"
+            json.dump({"shard": shard_name, "num_sequences": count}, mf)
+            mf.write("\n")
+
+    print(f"✅  Wrote {len(order):,} samples to {out_dir} across {len(shard_counts)} shards; manifest.jsonl created")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI entry-point

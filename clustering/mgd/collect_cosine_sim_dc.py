@@ -10,8 +10,9 @@ contain ``{"tokens": [...]}`` and, for every batch
 (2) average the features across the batch,
 (3) compute the cosine similarity against a **target vector** provided on the
     command line, and
-(4) store all similarities in a single ``.npy`` file named
-    ``{<wds_dir-basename>}_iter_{<iter>}.npy``.
+(4) store all similarities in a ``.npz`` file named
+    ``{<wds_dir-basename>}.npz`` inside a sub-directory
+    ``iter_<iter>`` that is created under the output directory.
 
 Only minimal changes compared to ``collect_grads_dc.py``:
 * new CLI flag ``--target-vector`` – path to ``.npy`` containing a 1-D target
@@ -310,7 +311,7 @@ def main(args):
 
         dot_products_gpu.append(dots)
         l2_norms_gpu.append(norms)
-        if len(l2_norms_gpu) > 500:
+        if len(l2_norms_gpu) > args.max_items:
             # dont waste compute on massive clusters
             break
 
@@ -319,11 +320,12 @@ def main(args):
     l2_norms = torch.cat(l2_norms_gpu).cpu().numpy().astype(np.float32)
 
     # Resolve and create output directory if it does not exist
-    out_dir_path = Path(args.out_dir).expanduser()
-    if not out_dir_path.exists():
-        out_dir_path.mkdir(parents=True, exist_ok=True)
+    # Create sub-directory "iter_<iter>" under the base output directory.
+    out_dir_path = Path(args.out_dir).expanduser() / f"iter_{args.iter}"
+    out_dir_path.mkdir(parents=True, exist_ok=True)
 
-    out_path = out_dir_path / f"{wds_dir_path.name}_iter_{args.iter}.npz"
+    # Output file no longer includes the iteration index in its name.
+    out_path = out_dir_path / f"{wds_dir_path.name}.npz"
     np.savez(out_path, dot=dot_products, l2=l2_norms)
     print(
         f"saved {dot_products.shape[0]} per-sample dot products and norms → {out_path}"
@@ -340,7 +342,8 @@ if __name__ == "__main__":
     ap.add_argument("--iter", type=int, default=0, help="iteration index used in output file name")
     ap.add_argument("--lora-rank", type=int, default=128)
     ap.add_argument("--num-blocks", type=int, default=8)
-    ap.add_argument("--out-dir", default="clustering/mgd", help="Directory where output .npy will be written (default: clustering/mgd/)")
+    ap.add_argument("--out-dir", default="clustering/mgd", help="Directory where output will be written (default: clustering/mgd/)")
+    ap.add_argument("--max-items", type=int, default=500, help="maximum number of batches processed before stopping early (default: 500)")
     args = ap.parse_args()
 
     if (args.uuid is None) == (args.ckpt is None):
