@@ -104,13 +104,13 @@ def main() -> None:
 
     grad_norms = torch.empty(N, dtype=torch.float32)
 
-    PROC_BS = 8192  # rows per GPU batch
+    PROC_BS = 16384  # rows per GPU batch
     device_gpu = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     for start in tqdm(range(0, N, PROC_BS), disable=not args.verbose):
         end = min(start + PROC_BS, N)
 
-        batch = grads_cpu[start:end].to(device_gpu, non_blocking=True)  # (bs, B, d)
+        batch = grads_cpu[start:end].to(device_gpu)  # (bs, B, d)
         flat = batch.reshape(end - start, -1)                           # (bs, B*d)
         norms = flat.norm(p=2, dim=1)                                   # (bs,)
 
@@ -176,9 +176,12 @@ def main() -> None:
         lam = max(lam, 0.0)
 
         F_reg = F + lam * eye_gpu
+        
+        # Invert the regularised Fisher block and store the inverse (whitening matrix)
+        F_reg_inv = torch.linalg.inv(F_reg)
 
-        # Store the regularised Fisher block (Hessian)
-        hessians[b] = F_reg.to(torch.float32).cpu()
+        # Store the inverse Hessian block
+        hessians[b] = F_reg_inv.to(torch.float32).cpu()
 
         if args.verbose:
             cond_before = w_max / w_min
@@ -187,7 +190,7 @@ def main() -> None:
                 f"Block {b:>3d}: λ={lam:.3e}  cond_before={cond_before:.3e}  cond_after={cond_after:.3e}"
             )
         # Cleanup GPU memory
-        del X, F, F_reg, w
+        del X, F, F_reg, F_reg_inv, w
         torch.cuda.empty_cache() if device.type == "cuda" else None
 
     # ----------------------------

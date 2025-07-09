@@ -17,7 +17,7 @@ ones):
 
     python create_mmap_features.py \
         --num-shards 120 \
-        --shard-size 1000 \
+        --shard-size 1024 \
         --lora-rank 128 \
         --num-blocks 8 \
         --out clustering/mgd/features.fp16
