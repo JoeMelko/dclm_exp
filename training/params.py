@@ -208,10 +208,11 @@ def add_dcnlp_args(parser):
         default=0,
         help="This is the maximum number of failed checkpoints (due to not having seen enough tokens) that are allowed",
     )
+    # NOTE: single flag to disable all forms of data shuffling
     parser.add_argument(
-        "--no-shard-shuffle",
+        "--no-shuffle",
         action="store_true",
-        help="Whether to disable shard shuffle in the curriculum.",
+        help="Disable all dataset shuffling (equivalent to both --no-shard-shuffle and --disable-buffer).",
     )
 
     # ------------------------------------------------------------------
@@ -481,9 +482,10 @@ def get_open_lm_args(args, hparams, dr):
     if args.torchcompile:
         open_lm_args.append("--torchcompile")
 
-    # Forward curriculum flag to open_lm
-    if args.no_shard_shuffle:
-        open_lm_args.append("--no-shard-shuffle")
+    # Forward shuffling flag to open_lm
+    if args.no_shuffle:
+        # Disable both shard and buffer shuffling in open_lm.
+        open_lm_args.extend(["--no-shard-shuffle", "--disable-buffer"])
 
     if args.keep_previous_checkpoints and "--delete-previous-checkpoint" in open_lm_args:
         open_lm_args.remove("--delete-previous-checkpoint")

@@ -11,7 +11,7 @@ import numpy as np
 
 Example
 -------
-python -m dclm_exp.clustering.mgd.update_logits \
+python update_logits \
     --counts path/to/counts.json \
     --scores-dir path/to/scores_dir \
     --out-path path/to/updated_counts.json \
@@ -29,7 +29,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--counts", type=str, required=True, help="Path to counts JSON file.")
     parser.add_argument("--scores-dir", type=str, required=True, help="Directory containing dataset{i}.npz score files.")
     parser.add_argument("--out-path", type=str, required=True, help="Path where updated counts JSON should be saved.")
-    parser.add_argument("--lr", type=float, default=1, help="Learning rate for logit update (default: 0.1).")
+    parser.add_argument("--lr", type=float, default=0.2, help="Learning rate for logit update (default: 0.2).")
+    parser.add_argument("--max-z", type=float, default=5, help="Maximum standard deviation for outlier clipping (default: 5).")
     parser.add_argument("--means-out", type=str, default=None, help="Optional path to save the scaled mean dot values (JSON).")
     return parser.parse_args()
 
@@ -74,8 +75,8 @@ def load_score_files(scores_dir: str) -> (List[np.ndarray], List[np.ndarray]):
     return dots, l2s
 
 
-def compute_adjustments(dots: List[np.ndarray], l2s: List[np.ndarray]) -> np.ndarray:
-    """Compute mean of clipped dot/l2 ratios for each dataset and rescale to [-1,1]."""
+def compute_adjustments(dots: List[np.ndarray], l2s: List[np.ndarray], max_z: float) -> np.ndarray:
+    """Compute mean of clipped dot/l2 ratios for each dataset, z-score them (mean=0, std=1), then clip to [-max_z, max_z]."""
     # Determine global 99.9th percentile of l2 norms
     all_l2_concat = np.concatenate(l2s)
     l2_thresh = np.percentile(all_l2_concat, 99.9)
@@ -87,13 +88,17 @@ def compute_adjustments(dots: List[np.ndarray], l2s: List[np.ndarray]) -> np.nda
         clipped = dot_arr / denom
         means[idx] = clipped.mean()
 
-    # Linearly transform means to span [-1, 1]
-    min_val = means.min()
-    max_val = means.max()
-    if math.isclose(max_val, min_val):
-        # Avoid division by zero – all means identical, set to zeros
-        return np.zeros_like(means)
-    adjusted = 2 * (means - min_val) / (max_val - min_val) - 1  # range [-1,1]
+    # Standardize to mean 0, std 1
+    mean_val = means.mean()
+    std_val = means.std()
+    if math.isclose(std_val, 0):
+        adjusted = np.zeros_like(means)
+    else:
+        adjusted = (means - mean_val) / std_val
+
+    # Clip to the specified z-range
+    adjusted = np.clip(adjusted, -max_z, max_z)
+
     return adjusted
 
 
@@ -135,8 +140,8 @@ def main():
     # Step 2: Load score files
     dots, l2s = load_score_files(args.scores_dir)
 
-    # Step 3: Compute adjustment values in [-1,1]
-    adjustments = compute_adjustments(dots, l2s)
+    # Step 3: Compute z-score adjustment values and clip
+    adjustments = compute_adjustments(dots, l2s, max_z=args.max_z)
 
     # Optionally save scaled mean dot values
     if args.means_out:

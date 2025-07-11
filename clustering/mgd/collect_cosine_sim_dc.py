@@ -50,7 +50,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 # -------------------- configuration -------------------- #
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 # ------------------------------------------------------- #
 
 # --- optional: only needed when you use --uuid -----------------------------

@@ -303,7 +303,7 @@ def main(argv: List[str] | None = None):
                    help="JSON mapping <basename(input_dir)> → target sample count n_i")
     p.add_argument("--output-dir", type=Path, required=True,
                    help="Destination directory for the merged dataset")
-    p.add_argument("--shard-size", "--maxcount", dest="maxcount", type=int, default=8192,
+    p.add_argument("--shard-size", "--maxcount", dest="maxcount", type=int, default=1024,
                    help="Maximum #samples per output shard (ShardWriter). Alias: --shard-size")
     p.add_argument("--seed", type=int, default=0,
                    help="Global RNG seed")
