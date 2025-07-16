@@ -13,11 +13,11 @@
 #
 # Example
 #   ./launch_collect_features.sh \
-#       --wds-dir /data/tokenised_wds \
-#       --uuid 123e4567-e89b-12d3-a456-426614174000 \
-#       --shards-per-gpu 15 \
-#       --shard-size 1000 \
-#       --out clustering/mgd/features.fp16
+#       --wds-dir /home/jmelko/baseline/ \
+#       --uuid testt5-d=1024_l=24_h=8-warm=2000-lr=0p003-wd=0p033-cd=3e-05-bs=512-mult=1-seed=3210-tokens=8232325120 \
+#       --shards-per-gpu 128 \
+#       --shard-size 1024 \
+#       --out /home/jmelko/four/features.fp16
 #
 # Any flag accepted by create_mmap_features.py / collect_features_dc.py may be
 # specified here (e.g. --lora-rank, --num-blocks, --out, ...).
@@ -65,7 +65,7 @@ for GPU_ID in $(seq 0 $((GPU_COUNT-1))); do
     START_OFFSET=$((GPU_ID * SHARDS_PER_GPU * SHARD_SIZE))
 
     CUDA_VISIBLE_DEVICES="$GPU_ID" \
-    python mgd/collect_features_dc.py \
+    python collect_features_dc.py \
         --gpu-id "$GPU_ID" \
         --total-gpus "$GPU_COUNT" \
         --chunk-size "$SHARDS_PER_GPU" \

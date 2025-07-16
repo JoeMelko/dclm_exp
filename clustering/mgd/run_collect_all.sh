@@ -17,6 +17,33 @@
 #   • No polling of external utilities; only builtin Bash + `kill -0` checks.
 #   • Clear 1-to-1 mapping of job ↔ GPU throughout its lifetime.
 # -----------------------------------------------------------------------------
+# Usage:
+#   run_collect_all.sh PARENT_DIR [options_for_collect_cosine_sim_dc.py]
+#
+# Arguments:
+#   PARENT_DIR   Directory whose first-level sub-directories will each be
+#                processed by collect_cosine_sim_dc.py.
+#   options      Any extra command-line flags are forwarded verbatim to
+#                collect_cosine_sim_dc.py for every dataset.
+#
+# Example:
+#   ./run_collect_all.sh /path/to/parent_dir \
+#       --target-vector vec.npy \
+#       --ckpt EleutherAI/pythia-1b \
+#       --iter 0 \
+#       --lora-rank 128 --num-blocks 8
+#
+# Forwarded arguments for collect_cosine_sim_dc.py:
+#   --uuid UUID | --ckpt CKPT  (required, exactly one) model checkpoint source
+#   --target-vector PATH   (required) .npy file containing flattened target
+#                          vector (already whitened & L2-normalised)
+#   --iter INT             iteration index added to output filename [default: 0]
+#   --lora-rank INT        LoRA rank for adapters [default: 128]
+#   --num-blocks INT       number of transformer blocks logged [default: 8]
+#   --max-items INT        maximum number of batches processed per dataset before early stop [default: 500]
+#   --out-dir DIR          directory where outputs are written; results for each --iter value
+#                          are stored in a sub-directory named "iter_<iter>"
+# -----------------------------------------------------------------------------
 set -euo pipefail
 
 # ----------------------------- configuration ---------------------------------
@@ -49,6 +76,7 @@ total=${#SUBDIRS[@]}
 launch_job() {
   local gpu_idx=$1
   local wds_dir=$2
+  shift 2               # drop positional params so only extra flags remain
   echo "[GPU ${GPU_IDS[$gpu_idx]}] Launching $wds_dir" >&2
   CUDA_VISIBLE_DEVICES="${GPU_IDS[$gpu_idx]}" \
     python "$COLLECT_SCRIPT" --wds-dir "$wds_dir" "$@" &
@@ -75,7 +103,8 @@ while :; do
       # GPU free
       if [[ $next_idx -lt $total ]]; then
         launch_job "$idx" "${SUBDIRS[$next_idx]}" "$@"
-        ((next_idx++))
+        echo "after1"
+        ((next_idx+=1))
       else
         GPU_PIDS[$idx]=""  # no more work, clear slot
       fi

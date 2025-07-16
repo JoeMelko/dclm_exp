@@ -12,7 +12,7 @@
 #       --wds-dir /data/tokenised_wds \
 #       --uuid 123e4567-e89b-12d3-a456-426614174000 \
 #       --chunk-size 15 \
-#       --shard-size 1000 \
+#       --shard-size 8192 \
 #       --lora-rank 128 \
 #       --num-blocks 8 \
 #       --out-dir clustering/mgd/targets
