@@ -76,7 +76,8 @@ def load_score_files(scores_dir: str) -> (List[np.ndarray], List[np.ndarray]):
 
 
 def compute_adjustments(dots: List[np.ndarray], l2s: List[np.ndarray], max_z: float) -> np.ndarray:
-    """Compute mean of clipped dot/l2 ratios for each dataset, z-score them (mean=0, std=1), then clip to [-max_z, max_z]."""
+    """Compute mean of clipped dot/l2 ratios for each dataset, z-score them (mean=0, std=1) using robust
+    statistics that ignore the top and bottom 0.1% of entries, then clip to [-max_z, max_z]."""
     # Determine global 99.9th percentile of l2 norms
     all_l2_concat = np.concatenate(l2s)
     l2_thresh = np.percentile(all_l2_concat, 99.9)
@@ -88,9 +89,18 @@ def compute_adjustments(dots: List[np.ndarray], l2s: List[np.ndarray], max_z: fl
         clipped = dot_arr / denom
         means[idx] = clipped.mean()
 
-    # Standardize to mean 0, std 1
-    mean_val = means.mean()
-    std_val = means.std()
+    # Standardize to mean 0, std 1 using robust statistics
+    # Ignore the extreme 0.1% tails when computing mean and std to reduce the impact of outliers.
+    lower_thresh = np.percentile(means, 0.1)
+    upper_thresh = np.percentile(means, 99.9)
+    trimmed = means[(means >= lower_thresh) & (means <= upper_thresh)]
+
+    # Fallback: if trimming removed all values (unlikely), revert to full array statistics.
+    if trimmed.size == 0:
+        trimmed = means
+
+    mean_val = trimmed.mean()
+    std_val = trimmed.std()
     if math.isclose(std_val, 0):
         adjusted = np.zeros_like(means)
     else:

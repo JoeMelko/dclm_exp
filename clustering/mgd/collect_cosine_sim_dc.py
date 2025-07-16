@@ -343,7 +343,7 @@ if __name__ == "__main__":
     ap.add_argument("--lora-rank", type=int, default=128)
     ap.add_argument("--num-blocks", type=int, default=8)
     ap.add_argument("--out-dir", default="clustering/mgd", help="Directory where output will be written (default: clustering/mgd/)")
-    ap.add_argument("--max-items", type=int, default=500, help="maximum number of batches processed before stopping early (default: 500)")
+    ap.add_argument("--max-items", type=int, default=32, help="maximum number of batches processed before stopping early (default: 500)")
     args = ap.parse_args()
 
     if (args.uuid is None) == (args.ckpt is None):
