@@ -72,6 +72,7 @@ for GPU_ID in $(seq 0 $((GPU_COUNT-1))); do
         --num-shards "$TOTAL_SHARDS" \
         --shard-size "$SHARD_SIZE" \
         --start-offset "$START_OFFSET" \
+        --workers 0 \
         "${EXTRA_ARGS[@]}" &
 
 done

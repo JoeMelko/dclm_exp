@@ -47,14 +47,14 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Aggregate and whiten target direction vectors.")
     p.add_argument("--num-gpus", type=int, required=True,
                    help="Number of per-GPU result directories (dir_0 … dir_{N-1}).")
-    p.add_argument("--root-dir", type=str, default=".",
+    p.add_argument("--root-dir", type=str, required=True,
                    help="Parent directory containing the per-GPU sub-directories.")
     p.add_argument("--whiteners-path", type=str, required=True,
                    help="Path to the (2*num_blocks, d, d) whitener tensor produced by hessian.py.")
-    p.add_argument("--out-path", type=str, default="whitened_target.npy",
+    p.add_argument("--out-path", type=str, required=True,
                    help="Destination .npy file for the whitened, normalised target direction.")
-    p.add_argument("--dtype", choices=["fp32", "fp16"], default="fp32",
-                   help="Output dtype (default: fp32).")
+    p.add_argument("--dtype", choices=["fp32", "fp16"], required=True,
+                   help="Output dtype (fp32 or fp16).")
     return p.parse_args()
 
 

@@ -339,11 +339,11 @@ if __name__ == "__main__":
     ap.add_argument("--target-vector", required=True, help="path to .npy containing flattened target vector (already whitened + L2-normalised)")
     ap.add_argument("--uuid", help="Datacomp-LM run UUID (overrides --ckpt)")
     ap.add_argument("--ckpt", help="HuggingFace checkpoint path or Hub ID")
-    ap.add_argument("--iter", type=int, default=0, help="iteration index used in output file name")
-    ap.add_argument("--lora-rank", type=int, default=128)
-    ap.add_argument("--num-blocks", type=int, default=8)
-    ap.add_argument("--out-dir", default="clustering/mgd", help="Directory where output will be written (default: clustering/mgd/)")
-    ap.add_argument("--max-items", type=int, default=32, help="maximum number of batches processed before stopping early (default: 500)")
+    ap.add_argument("--iter", type=int, required=True, help="iteration index used in output file name")
+    ap.add_argument("--lora-rank", type=int, required=True)
+    ap.add_argument("--num-blocks", type=int, required=True)
+    ap.add_argument("--out-dir", required=True, help="Directory where output will be written")
+    ap.add_argument("--max-items", type=int, required=True, help="maximum number of batches processed before stopping early")
     args = ap.parse_args()
 
     if (args.uuid is None) == (args.ckpt is None):

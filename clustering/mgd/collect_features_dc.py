@@ -297,18 +297,18 @@ if __name__ == "__main__":
     ap.add_argument("--uuid", required=True, help="Datacomp-LM run UUID")
 
     # mmap / sharding related flags (identical semantics to collect_grads.py)
-    ap.add_argument("--out",   default="clustering/mgd/features.fp16",
+    ap.add_argument("--out",   required=True,
                     help="output memmap filename")
-    ap.add_argument("--lora-rank",  type=int, default=128)
-    ap.add_argument("--num-blocks", type=int, default=8)
-    ap.add_argument("--chunk-size", type=int, default=15,
-                    help="contiguous shard block size assigned in one go (default 15)")
-    ap.add_argument("--gpu-id", type=int, default=int(os.environ.get("GPU_ID", 0)),
+    ap.add_argument("--lora-rank",  type=int, required=True)
+    ap.add_argument("--num-blocks", type=int, required=True)
+    ap.add_argument("--chunk-size", type=int, required=True,
+                    help="contiguous shard block size assigned in one go")
+    ap.add_argument("--gpu-id", type=int, required=True,
                     help="numeric id of the current GPU / process [0-7]")
-    ap.add_argument("--total-gpus", type=int, default=8,
+    ap.add_argument("--total-gpus", type=int, required=True,
                     help="how many independent GPU workers will run in parallel")
-    ap.add_argument("--num-shards", type=int, default=120,
-                    help="total number of dataset shards (default 120)")
+    ap.add_argument("--num-shards", type=int, required=True,
+                    help="total number of dataset shards")
     ap.add_argument("--shard-size", type=int, required=True,
                     help="number of samples per shard")
     ap.add_argument("--start-offset", type=int, required=True,

@@ -64,10 +64,10 @@ if __name__ == "__main__":
                     help="total number of dataset shards")
     ap.add_argument("--shard-size", type=int, required=True,
                     help="number of samples per shard")
-    ap.add_argument("--out", default="clustering/mgd/features.fp16",
+    ap.add_argument("--out", required=True,
                     help="output memmap filename")
-    ap.add_argument("--lora-rank", type=int, default=128)
-    ap.add_argument("--num-blocks", type=int, default=8)
+    ap.add_argument("--lora-rank", type=int, required=True)
+    ap.add_argument("--num-blocks", type=int, required=True)
     ap.add_argument("--wds-dir", help="(ignored) dataset directory")
     ap.add_argument("--uuid", help="(ignored) model UUID")
     ap.add_argument("--ckpt", help="(ignored) HuggingFace checkpoint path")

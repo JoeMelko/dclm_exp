@@ -46,19 +46,19 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Compute regularised Fisher (Hessian) blocks from gradient memmap.")
     p.add_argument("--mmap-path", type=str, required=True,
                    help="Path to the memory‑mapped file produced during gradient collection.")
-    p.add_argument("--rank", type=int, default=128,
+    p.add_argument("--rank", type=int, required=True,
                    help="Rank of the projection matrices (d = rank*rank features per block).")
-    p.add_argument("--num-blocks", type=int, default=8,
+    p.add_argument("--num-blocks", type=int, required=True,
                    help="Number of projection blocks. Total blocks processed = 2 * num_blocks.")
-    p.add_argument("--dtype", choices=["fp16", "fp32"], default="fp16",
+    p.add_argument("--dtype", choices=["fp16", "fp32"], required=True,
                    help="Storage dtype of the memmap ('fp16' or 'fp32').")
-    p.add_argument("--cond", type=float, default=1e4,
+    p.add_argument("--cond", type=float, required=True,
                    help="Target condition number after ridge regularization.")
     p.add_argument("--out-path", type=str, required=True,
                    help="Destination .npy file for the whitening matrices (shape=(2*num_blocks, rank^2, rank^2)).")
     p.add_argument("--verbose", action="store_true",
                    help="Print per-block diagnostics.")
-    p.add_argument("--clip-percentile", type=float, default=99.9,
+    p.add_argument("--clip-percentile", type=float, required=True,
                    help="Percentile used to compute the clipping threshold (e.g. 99.9 means clip to the 99.9th percentile norm).")
     p.add_argument("--norms-path", type=str, default=None,
                    help="Optional path to store the per-sample L2 norms (float32, shape=(N,)). If omitted, '<out-path>_norms.npy' is used.")
