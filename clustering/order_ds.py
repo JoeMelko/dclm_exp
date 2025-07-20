@@ -305,7 +305,7 @@ def main(argv: List[str] | None = None):
                    help="Destination directory for the merged dataset")
     p.add_argument("--shard-size", "--maxcount", dest="maxcount", type=int, default=1024,
                    help="Maximum #samples per output shard (ShardWriter). Alias: --shard-size")
-    p.add_argument("--seed", type=int, default=0,
+    p.add_argument("--seed", type=int, required=True,
                    help="Global RNG seed")
 
     args = p.parse_args(argv)
