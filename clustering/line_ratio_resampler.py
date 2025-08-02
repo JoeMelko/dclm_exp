@@ -8,7 +8,8 @@ Usage example
         --input-root /data/my_datasets \
         --ratios ratios.json \
         --output-dir /data/processed \
-        --num-shards 100000 \
+        --num-shards 16 \
+        --num-dirs 4 \
         --first-third  # optional: only use first third of each dataset \
         --seed 42
 
@@ -181,40 +182,64 @@ def load_dataset_lines(ds_dir: Path) -> List[str]:
     return list(_open_zstd_text(src))
 
 
-def write_shards(all_lines: Sequence[str], out_dir: Path, num_shards: int):
-    """Write *all_lines* evenly to *num_shards* (compressed ``.jsonl.zstd`` files).
+def write_shards(
+    all_lines: Sequence[str],
+    out_dir: Path,
+    num_shards: int,
+    num_dirs: int = 1,
+):
+    """Write *all_lines* evenly to *num_shards* across *num_dirs* sub-directories.
 
     Every shard receives either ⌊N/S⌋ or ⌈N/S⌉ lines (*N* = total lines,
     *S* = *num_shards*), guaranteeing that shard sizes differ by **at most 1**.
+
+    If ``num_dirs`` > 1, shards are assigned **sequentially** to directories
+    named ``sub_dir0``, ``sub_dir1`` … ``sub_dir<num_dirs-1>`` such that
+    directory *d* contains shards in the closed interval
+    ``[d * (S / D), (d + 1) * (S / D))`` (example: ``S=16``, ``D=4`` → 0–3,
+    4–7, 8–11, 12–15).
     """
 
     if num_shards <= 0:
         raise ValueError("--num-shards must be a positive integer")
+    if num_dirs <= 0:
+        raise ValueError("--num-dirs must be a positive integer")
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
     total = len(all_lines)
     base, remainder = divmod(total, num_shards)  # each shard gets *base* or +1
 
+    # Pre-compute how many shards each directory should hold (ceil division).
+    shards_per_dir = math.ceil(num_shards / num_dirs)
+
     shard_counts: List[int] = []
     pos = 0
     for shard_idx in range(num_shards):
         this_size = base + (1 if shard_idx < remainder else 0)
         shard_lines = all_lines[pos : pos + this_size]
-        out_path = out_dir / f"shard_{shard_idx:08d}_processed.jsonl.zstd"
+
+        dir_idx = shard_idx // shards_per_dir
+        sub_dir = out_dir / f"sub_dir{dir_idx}"
+        sub_dir.mkdir(parents=True, exist_ok=True)
+
+        out_path = sub_dir / f"shard_{shard_idx:08d}_processed.jsonl.zstd"
         _write_zstd_lines(shard_lines, out_path)
         shard_counts.append(len(shard_lines))
         pos += this_size
 
-    # Optional manifest.jsonl
-    manifest = out_dir / "manifest.jsonl"
-    with manifest.open("w", encoding="utf-8") as mf:
-        for i, cnt in enumerate(shard_counts):
-            shard_name = f"shard_{i:08d}_processed"
-            json.dump({"shard": shard_name, "num_lines": cnt}, mf)
-            mf.write("\n")
+    # Disabled manifest.jsonl writing; previously wrote manifest.jsonl
+    # manifest = out_dir / "manifest.jsonl"
+    # with manifest.open("w", encoding="utf-8") as mf:
+    #     for i, cnt in enumerate(shard_counts):
+    #         shard_name = f"shard_{i:08d}_processed"
+    #         json.dump({"shard": shard_name, "num_lines": cnt}, mf)
+    #         mf.write("\n")
 
-    print(f"✅  Wrote {sum(shard_counts):,} lines to {len(shard_counts)} shards in {out_dir}")
+    print(
+        f"✅  Wrote {sum(shard_counts):,} lines to {len(shard_counts)} shards across "
+        f"{num_dirs} dir(s) in {out_dir}"
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI entry-point
@@ -232,6 +257,8 @@ def main(argv: list[str] | None = None):
                    help="Destination directory for the processed shards")
     p.add_argument("--num-shards", dest="num_shards", type=int, required=True,
                    help="Number of output shards; lines are divided as evenly as possible (sizes differ by ≤1)")
+    p.add_argument("--num-dirs", dest="num_dirs", type=int, default=1,
+                   help="Number of subdirectories to split shards into (sequential assignment)")
     p.add_argument("--seed", type=int, default=0, help="RNG seed for shuffling & extra-line selection")
     p.add_argument("--first-third", action="store_true",
                    help="Only consider the first third of lines in each dataset when applying ratios")
@@ -296,7 +323,7 @@ def main(argv: list[str] | None = None):
     else:
         rng.shuffle(all_lines)
 
-    write_shards(all_lines, args.output_dir, args.num_shards)
+    write_shards(all_lines, args.output_dir, args.num_shards, args.num_dirs)
 
 
 if __name__ == "__main__":
