@@ -67,13 +67,11 @@ except ImportError:  # nocov
 
 tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
 
-# ----------------------------- dataset wrapper ----------------------------- #
+# ----------------------------- dataset wrappers ---------------------------- #
 class HarmfulDataset(torch.utils.data.Dataset):
-    """Torch wrapper around the HF harmful-dataset.
+    """HuggingFace `LLM-LAT/harmful-dataset` – use *rejected* as completion."""
 
-    Returns dicts with the raw *prompt* and *rejected* strings so the collate
-    function can perform tokenisation with dynamic padding.
-    """
+    NAME = "harmful-dataset"
 
     def __init__(self, split: str = "train"):
         self.ds = load_dataset("LLM-LAT/harmful-dataset", split=split)
@@ -83,7 +81,24 @@ class HarmfulDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         rec = self.ds[idx]
-        return {"prompt": rec["prompt"], "rejected": rec["rejected"]}
+        return {"prompt": rec["prompt"], "completion": rec["rejected"]}
+
+
+class AdvBenchDataset(torch.utils.data.Dataset):
+    """HuggingFace `walledai/AdvBench` – use *target* as completion."""
+
+    NAME = "advbench"
+
+    def __init__(self, split: str = "train"):
+        # `AdvBench` is single split "train" in HF hub; ignore split argument.
+        self.ds = load_dataset("walledai/AdvBench", split="train")
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        rec = self.ds[idx]
+        return {"prompt": rec["prompt"], "completion": rec["target"]}
 
 # -------------------------- collate / padding ------------------------------ #
 
@@ -101,10 +116,10 @@ def collate(batch, *, max_length: int = 2048):
 
     for sample in batch:
         prompt_str   = sample["prompt"]
-        rejected_str = sample["rejected"]
+        completion_str = sample["completion"]
 
         prompt_ids = tokenizer(prompt_str, add_special_tokens=False)["input_ids"]
-        text_ids   = tokenizer(prompt_str + rejected_str, add_special_tokens=False)["input_ids"]
+        text_ids   = tokenizer(prompt_str + completion_str, add_special_tokens=False)["input_ids"]
 
         # Truncate if necessary (keep at least full prompt so mask aligns)
         if len(text_ids) > max_length:
@@ -169,23 +184,34 @@ def main(args):
     model.to(device, dtype=torch.bfloat16).eval()
 
     # ----- dataset -------------------------------------------------------- #
-    ds = HarmfulDataset(split=args.split)
-    loader = torch.utils.data.DataLoader(ds,
-                                         batch_size=args.batch_size,
-                                         shuffle=False,
-                                         num_workers=8,
-                                         collate_fn=lambda x: collate(x, max_length=args.max_length))
+    # Determine which datasets to evaluate.
+    selected_names = args.dataset or list(DATASET_REGISTRY.keys())
 
-    # ----- evaluation ----------------------------------------------------- #
-    total_samples = len(ds)
-    loss = evaluate(model, loader, device, total_samples=total_samples)
-    print(f"Cross-entropy loss (rejected only): {loss:.6f}\nPerplexity               : {math.exp(loss):.6f}")
+    for name in selected_names:
+        ds_cls = DATASET_REGISTRY.get(name)
+        if ds_cls is None:
+            raise ValueError(f"Unsupported dataset: {name}")
+
+        print(f"\n=== Evaluating dataset: {name} ===")
+        ds = ds_cls(split=args.split)
+        loader = torch.utils.data.DataLoader(ds,
+                                             batch_size=args.batch_size,
+                                             shuffle=False,
+                                             num_workers=8,
+                                             collate_fn=lambda x: collate(x, max_length=args.max_length))
+
+        # ----- evaluation ------------------------------------------------- #
+        total_samples = len(ds)
+        loss = evaluate(model, loader, device, total_samples=total_samples)
+        print(f"Dataset: {name}\n  Cross-entropy loss (completion only): {loss:.6f}\n  Perplexity                         : {math.exp(loss):.6f}\n")
 
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--uuid", required=True,
                         help="Datacomp-LM / Open-LM run UUID identifying the checkpoint to evaluate")
+    parser.add_argument("--dataset", choices=list(DATASET_REGISTRY.keys()), nargs="*", default=[],
+                        help="Datasets to evaluate (space separated). If omitted, all datasets are evaluated.")
     parser.add_argument("--split", default="train",
                         help="Dataset split to evaluate (default: train)")
     parser.add_argument("--batch-size", type=int, default=16,
