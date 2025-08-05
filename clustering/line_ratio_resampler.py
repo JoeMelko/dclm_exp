@@ -182,8 +182,14 @@ def load_dataset_lines(ds_dir: Path) -> List[str]:
     return list(_open_zstd_text(src))
 
 
+# ============================================================================
+# Shard writer – with optional cluster index export
+# ============================================================================
+
+
 def write_shards(
     all_lines: Sequence[str],
+    cluster_ids: Sequence[int] | None,
     out_dir: Path,
     num_shards: int,
     num_dirs: int = 1,
@@ -208,6 +214,9 @@ def write_shards(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     total = len(all_lines)
+    if cluster_ids is not None and len(cluster_ids) != total:
+        raise ValueError("cluster_ids length must match number of lines")
+
     base, remainder = divmod(total, num_shards)  # each shard gets *base* or +1
 
     # Pre-compute how many shards each directory should hold (ceil division).
@@ -218,6 +227,9 @@ def write_shards(
     for shard_idx in range(num_shards):
         this_size = base + (1 if shard_idx < remainder else 0)
         shard_lines = all_lines[pos : pos + this_size]
+        shard_clusters = (
+            cluster_ids[pos : pos + this_size] if cluster_ids is not None else None
+        )
 
         dir_idx = shard_idx // shards_per_dir
         sub_dir = out_dir / f"sub_dir{dir_idx}"
@@ -225,6 +237,12 @@ def write_shards(
 
         out_path = sub_dir / f"shard_{shard_idx:08d}_processed.jsonl.zstd"
         _write_zstd_lines(shard_lines, out_path)
+
+        # Optional: save cluster indices alongside shard
+        if shard_clusters is not None:
+            clusters_out = sub_dir / f"shard_{shard_idx:08d}_processed_clusters.npy"
+            np.save(clusters_out, np.asarray(shard_clusters, dtype=np.int32))
+
         shard_counts.append(len(shard_lines))
         pos += this_size
 
@@ -239,6 +257,9 @@ def write_shards(
     print(
         f"✅  Wrote {sum(shard_counts):,} lines to {len(shard_counts)} shards across "
         f"{num_dirs} dir(s) in {out_dir}"
+        + (
+            " with cluster indices" if cluster_ids is not None else ""
+        )
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -265,6 +286,10 @@ def main(argv: list[str] | None = None):
     p.add_argument("--jitter", action="store_true",
                    help="Apply 2-way jitter (balanced intra-/inter-dataset spacing) instead of uniform shuffle")
 
+    # New: write cluster indices for ordered_tokenize.py
+    p.add_argument("--write-clusters", action="store_true",
+                   help="Emit *_clusters.npy files with the dataset index corresponding to each line")
+
     args = p.parse_args(argv)
     rng = random.Random(args.seed)
 
@@ -282,6 +307,7 @@ def main(argv: list[str] | None = None):
     ratio_map = {str(k): float(v) for k, v in ratio_map_raw.items()}
 
     all_lines: List[str] = []
+    all_clusters: List[int] = []  # aligns with *all_lines*
     cluster_ids: List[int] = []
     sample_ids: List[int] = []
     sample_lines: List[str] = []
@@ -315,15 +341,31 @@ def main(argv: list[str] | None = None):
             sample_lines.extend(selected_lines)
         else:
             all_lines.extend(selected_lines)
+            if args.write_clusters:
+                all_clusters.extend([idx] * len(selected_lines))
 
     # Order the final lines
     if args.jitter:
         order = nested_jittered_order(cluster_ids, sample_ids, seed=args.seed)
         all_lines = [sample_lines[i] for i in order]
     else:
-        rng.shuffle(all_lines)
+        if args.write_clusters:
+            perm = list(range(len(all_lines)))
+            rng.shuffle(perm)
+            all_lines = [all_lines[i] for i in perm]
+            all_clusters = [all_clusters[i] for i in perm]
+        else:
+            rng.shuffle(all_lines)
 
-    write_shards(all_lines, args.output_dir, args.num_shards, args.num_dirs)
+    clusters_param = None
+    if args.write_clusters:
+        if args.jitter:
+            # clusters derived after jitter ordering
+            clusters_param = [cluster_ids[i] for i in order]
+        else:
+            clusters_param = all_clusters
+
+    write_shards(all_lines, clusters_param, args.output_dir, args.num_shards, args.num_dirs)
 
 
 if __name__ == "__main__":

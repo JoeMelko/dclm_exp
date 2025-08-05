@@ -100,6 +100,15 @@ class AdvBenchDataset(torch.utils.data.Dataset):
         rec = self.ds[idx]
         return {"prompt": rec["prompt"], "completion": rec["target"]}
 
+# --------------------------------------------------------------------------- #
+#                             Dataset registry                                #
+# --------------------------------------------------------------------------- #
+
+DATASET_REGISTRY: dict[str, type[torch.utils.data.Dataset]] = {
+    "harmful": HarmfulDataset,
+    "advbench": AdvBenchDataset,
+}
+
 # -------------------------- collate / padding ------------------------------ #
 
 def collate(batch, *, max_length: int = 2048):
