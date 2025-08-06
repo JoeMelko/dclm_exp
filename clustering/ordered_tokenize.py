@@ -34,7 +34,7 @@ Web-dataset style tar archives named ``shard_XXXXXXXX.tar`` (chunk size
 8192 sequences by default).  Every sequence is stored inside the tar as
 *two* gzip-compressed JSON files:
 
-* ``<uuid>.tokens.json.gz``  → list of ints (length 2048)
+* ``<uuid>.tokens.json.gz``  → list of ints (length 2049)
 * ``<uuid>.counts.json.gz``  → list of ints (length=num_clusters)
 
 The relative order of pairs inside each shard mirrors the order of
@@ -62,6 +62,8 @@ from typing import Callable, Iterator, List, Tuple
 
 import numpy as np
 from tqdm import tqdm
+# Added for simple parallel processing
+import multiprocessing as mp
 
 try:
     # tiktoken is preferred – identical to the Rust implementation
@@ -113,7 +115,10 @@ def build_tokenizer(args: argparse.Namespace):
                 r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
             )
             core_bpe = load_tiktoken_from_file(Path(args.tokenizer_eleuther_path), regex_pattern)
-            return core_bpe.encode, 50254  # GPT-NeoX vocab size
+            # Create encoding function that allows special tokens, matching Rust behavior
+            def encode_fn(text):
+                return core_bpe.encode(text, allowed_special="all")
+            return encode_fn, 50254  # GPT-NeoX vocab size
         else:
             raise ValueError(
                 "Custom *.tiktoken* loading currently supported only for EleutherAI/gpt-neox-20b"
@@ -124,7 +129,10 @@ def build_tokenizer(args: argparse.Namespace):
             enc: tiktoken.Encoding = tiktoken.encoding_for_model("gpt-neox")
         except KeyError:
             enc = tiktoken.get_encoding("gpt2")
-        return enc.encode, enc.n_vocab
+        # Create encoding function that allows special tokens, matching Rust behavior
+        def encode_fn(text):
+            return enc.encode(text, allowed_special="all")
+        return encode_fn, enc.n_vocab
 
 
 ###############################################################################
@@ -162,7 +170,7 @@ def iter_lines(path: Path) -> Iterator[str]:
 ###############################################################################
 
 EOT_TOKEN_ID = 0  # matches Rust code
-SEQLEN = 2048
+SEQLEN = 2049
 CHUNK_SIZE = 8192  # sequences per tar shard
 
 
@@ -235,7 +243,15 @@ def process_pair(
     seq_tokens: List[int] = []
     seq_counts: List[int] = [0] * seq_writer.num_clusters
 
-    for idx, line in enumerate(iter_lines(jsonl_path)):
+    # Progress bar for this particular shard
+    for idx, line in enumerate(
+        tqdm(
+            iter_lines(jsonl_path),
+            total=n_docs,
+            desc=f"Shard {jsonl_path.name}",
+            leave=False,
+        )
+    ):
         # Parse json and extract text
         try:
             obj = json.loads(line)
@@ -317,21 +333,71 @@ def main():
     parser.add_argument("--tokenizer-eleuther-path", type=str, default="", help="Optional path to *.tiktoken file for EleutherAI/gpt-neox-20b")
     args = parser.parse_args()
 
-    encode_fn, vocab_size = build_tokenizer(args)
+    # Build a tokenizer once in the main process (informational)
+    _, vocab_size = build_tokenizer(args)
     print(f"Loaded tokenizer (vocab size {vocab_size})")
 
     input_dir = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
+
     pairs = discover_shards(input_dir)
     num_clusters = determine_num_clusters(pairs)
     print(f"Detected {num_clusters} clusters across shards")
 
-    writer = SequenceWriter(Path(args.output_dir), num_clusters)
+    # ------------------------------------------------------------------
+    # Worker to process a single (jsonl, clusters) pair in its own process
+    # ------------------------------------------------------------------
+    def _worker(idx: int, jsonl_path: str, clusters_path: str):  # type: ignore
+        """Process one shard pair in a separate process."""
 
-    for jsonl_path, clusters_path in tqdm(pairs, desc="Processing shards"):
-        process_pair(jsonl_path, clusters_path, encode_fn, writer)
+        # Re-create minimal args namespace for tokenizer construction inside worker
+        worker_args = argparse.Namespace(
+            tokenizer_name=args.tokenizer_name,
+            tokenizer_eleuther_path=args.tokenizer_eleuther_path,
+        )
 
-    writer.close()
-    print("Done.")
+        encode_fn, _ = build_tokenizer(worker_args)
+
+        # Use a dedicated sub-directory to avoid filename collisions
+        sub_out_dir = output_dir / f"part_{idx:05d}"
+        writer = SequenceWriter(sub_out_dir, num_clusters)
+
+        process_pair(Path(jsonl_path), Path(clusters_path), encode_fn, writer)
+        writer.close()
+
+    # ------------------------------------------------------------------
+    # Launch a separate process for every shard pair
+    # ------------------------------------------------------------------
+    processes: List[mp.Process] = []
+    for idx, (j_path, c_path) in enumerate(pairs):
+        p = mp.Process(target=_worker, args=(idx, str(j_path), str(c_path)))
+        p.start()
+        processes.append(p)
+
+    # Join with a progress bar so the user sees overall progress
+    for p in tqdm(processes, desc="Processing shards in parallel"):
+        p.join()
+
+    # ------------------------------------------------------------------
+    # Concatenate results: move .tar files back into main output directory
+    # with continuous numbering based on creation order of the input pairs
+    # ------------------------------------------------------------------
+    shard_counter = 0
+    for idx in range(len(pairs)):
+        sub_out_dir = output_dir / f"part_{idx:05d}"
+        if not sub_out_dir.exists():
+            continue
+        for tar_path in sorted(sub_out_dir.glob("*.tar")):
+            target_path = output_dir / f"shard_{shard_counter:08d}.tar"
+            tar_path.rename(target_path)
+            shard_counter += 1
+        # Clean up the (now empty) sub-directory
+        try:
+            sub_out_dir.rmdir()
+        except OSError:
+            pass
+
+    print(f"Done. Wrote {shard_counter} tar shards.")
 
 
 if __name__ == "__main__":
