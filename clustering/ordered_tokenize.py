@@ -64,6 +64,7 @@ import numpy as np
 from tqdm import tqdm
 # Added for simple parallel processing
 import multiprocessing as mp
+import torch  # Added for saving counts tensors alongside shards
 
 try:
     # tiktoken is preferred – identical to the Rust implementation
@@ -197,19 +198,19 @@ class SequenceWriter:
         if not self.buffer:
             return
         shard_path = self.output_dir / f"shard_{self.shard_id:08d}.tar"
+        # Save counts as a 2-D PyTorch tensor (num_sequences, num_clusters)
+        counts_path = self.output_dir / f"shard_{self.shard_id:08d}_counts.pt"
+        counts_tensor = torch.tensor([cnt for _, cnt in self.buffer], dtype=torch.int16)
+        torch.save(counts_tensor, counts_path)
+        # Write tokens only into the tar archive; counts are stored separately
         with tarfile.open(shard_path, "w") as tar:
-            for tokens, counts in self.buffer:
+            for tokens, _ in self.buffer:
                 uid = uuid.uuid4().hex
                 # tokens
                 tok_bytes = gzip.compress(json.dumps(tokens).encode("utf-8"))
                 tok_info = tarfile.TarInfo(f"{uid}.tokens.json.gz")
                 tok_info.size = len(tok_bytes)
                 tar.addfile(tok_info, BytesIO(tok_bytes))
-                # counts
-                cnt_bytes = gzip.compress(json.dumps(counts).encode("utf-8"))
-                cnt_info = tarfile.TarInfo(f"{uid}.counts.json.gz")
-                cnt_info.size = len(cnt_bytes)
-                tar.addfile(cnt_info, BytesIO(cnt_bytes))
         self.buffer.clear()
         self.shard_id += 1
 
@@ -331,6 +332,7 @@ def main():
     parser.add_argument("--output-dir", type=str, required=True, help="Directory to place output .tar shards")
     parser.add_argument("--tokenizer-name", type=str, default="EleutherAI/gpt-neox-20b", help="Tokenizer id (informational)")
     parser.add_argument("--tokenizer-eleuther-path", type=str, default="", help="Optional path to *.tiktoken file for EleutherAI/gpt-neox-20b")
+    parser.add_argument("--n-chunks", type=int, default=1, help="Number of output chunk directories to create (split shards evenly)")
     args = parser.parse_args()
 
     # Build a tokenizer once in the main process (informational)
@@ -340,64 +342,67 @@ def main():
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
 
-    pairs = discover_shards(input_dir)
-    num_clusters = determine_num_clusters(pairs)
+    all_pairs = discover_shards(input_dir)
+    num_clusters = determine_num_clusters(all_pairs)
     print(f"Detected {num_clusters} clusters across shards")
 
-    # ------------------------------------------------------------------
-    # Worker to process a single (jsonl, clusters) pair in its own process
-    # ------------------------------------------------------------------
-    def _worker(idx: int, jsonl_path: str, clusters_path: str):  # type: ignore
+    num_chunks = max(1, args.n_chunks)
+    chunk_size = (len(all_pairs) + num_chunks - 1) // num_chunks  # ceil division
+
+    def _worker(jsonl_path: str, clusters_path: str, dest_dir: Path):  # type: ignore
         """Process one shard pair in a separate process."""
 
-        # Re-create minimal args namespace for tokenizer construction inside worker
         worker_args = argparse.Namespace(
             tokenizer_name=args.tokenizer_name,
             tokenizer_eleuther_path=args.tokenizer_eleuther_path,
         )
-
         encode_fn, _ = build_tokenizer(worker_args)
-
-        # Use a dedicated sub-directory to avoid filename collisions
-        sub_out_dir = output_dir / f"part_{idx:05d}"
-        writer = SequenceWriter(sub_out_dir, num_clusters)
-
+        writer = SequenceWriter(dest_dir, num_clusters)
         process_pair(Path(jsonl_path), Path(clusters_path), encode_fn, writer)
         writer.close()
 
-    # ------------------------------------------------------------------
-    # Launch a separate process for every shard pair
-    # ------------------------------------------------------------------
-    processes: List[mp.Process] = []
-    for idx, (j_path, c_path) in enumerate(pairs):
-        p = mp.Process(target=_worker, args=(idx, str(j_path), str(c_path)))
-        p.start()
-        processes.append(p)
+    shard_counter_global = 0
 
-    # Join with a progress bar so the user sees overall progress
-    for p in tqdm(processes, desc="Processing shards in parallel"):
-        p.join()
+    for chunk_idx in range(num_chunks):
+        start = chunk_idx * chunk_size
+        end = min(start + chunk_size, len(all_pairs))
+        chunk_pairs = all_pairs[start:end]
 
-    # ------------------------------------------------------------------
-    # Concatenate results: move .tar files back into main output directory
-    # with continuous numbering based on creation order of the input pairs
-    # ------------------------------------------------------------------
-    shard_counter = 0
-    for idx in range(len(pairs)):
-        sub_out_dir = output_dir / f"part_{idx:05d}"
-        if not sub_out_dir.exists():
-            continue
-        for tar_path in sorted(sub_out_dir.glob("*.tar")):
-            target_path = output_dir / f"shard_{shard_counter:08d}.tar"
-            tar_path.rename(target_path)
-            shard_counter += 1
-        # Clean up the (now empty) sub-directory
-        try:
-            sub_out_dir.rmdir()
-        except OSError:
-            pass
+        chunk_out_root = output_dir / f"sub{chunk_idx}"
+        chunk_out_root.mkdir(parents=True, exist_ok=True)
 
-    print(f"Done. Wrote {shard_counter} tar shards.")
+        # Spawn processes for this chunk
+        processes: List[mp.Process] = []
+        for local_idx, (j_path, c_path) in enumerate(chunk_pairs):
+            dest_dir = chunk_out_root / f"part_{local_idx:05d}"
+            p = mp.Process(target=_worker, args=(str(j_path), str(c_path), dest_dir))
+            p.start()
+            processes.append(p)
+
+        for p in tqdm(processes, desc=f"Chunk {chunk_idx}: processing", leave=False):
+            p.join()
+
+        # Concatenate within this chunk directory
+        shard_counter = 0
+        for part_dir in sorted(chunk_out_root.glob("part_*")):
+            for tar_path in sorted(part_dir.glob("*.tar")):
+                target_path = chunk_out_root / f"shard_{shard_counter:08d}.tar"
+                tar_path.rename(target_path)
+
+                counts_src = tar_path.with_suffix("").with_name(f"{tar_path.stem}_counts.pt")
+                if counts_src.exists():
+                    counts_dst = chunk_out_root / f"shard_{shard_counter:08d}_counts.pt"
+                    counts_src.rename(counts_dst)
+                shard_counter += 1
+            # cleanup part dir
+            try:
+                part_dir.rmdir()
+            except OSError:
+                pass
+
+        shard_counter_global += shard_counter
+
+    print(f"Done. Wrote {shard_counter_global} tar shards across {num_chunks} chunk directories.")
 
 
 if __name__ == "__main__":

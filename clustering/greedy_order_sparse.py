@@ -29,13 +29,12 @@ Usage
      python greedy_order.py \
          --input-dir   /path/to/tokenized_shards \
          --ratio-file  cluster_ratios.json \
-         --output-dir  /path/to/ordered_tokens \  # tokens shards
-         --counts-dir  /path/to/ordered_counts \  # parallel counts shards
+         --out-dir     /path/to/ordered_tokens \  # tokens shards + manifest
          --shard-size 8192 \
          --gpus 8
  
-This writes token shards into ``--output-dir`` and matching counts-only
-shards into ``--counts-dir``.
+This writes token shards into ``--out-dir`` and matching counts-only
+shards into ``--out-dir/counts``.
 """
 
 from __future__ import annotations
@@ -131,106 +130,80 @@ def stream_shards_to_arrays(
 
 
 # --------------------------------------------------------------------------- #
-# GPU helper                                                                  #
+# CPU-sparse helper                                                            #
 # --------------------------------------------------------------------------- #
-@dataclass
-class GPUPartition:
-    counts  : torch.Tensor  # (n_seq, n_cluster) float32 (tokens per cluster)
-    lengths : torch.Tensor  # (n_seq,)  int32  (total tokens per seq)
-    used    : torch.Tensor  # (n_seq,)  bool
-    meta    : list[SequenceMeta]
-    indices : np.ndarray   # global indices
 
-def split_across_gpus(counts_all: torch.Tensor, meta_all: list[SequenceMeta], ngpu: int) -> list[GPUPartition]:
-    parts: list[GPUPartition] = []
-    idxs = np.array_split(np.arange(counts_all.shape[0]), ngpu)
-    for dev_id, idx in enumerate(idxs):
-        device = f'cuda:{dev_id}'
-        idx_list = idx.tolist()
-        part_counts_f32 = counts_all[idx_list].to(device=device, dtype=torch.float32)
-        part_len        = part_counts_f32.sum(dim=1, dtype=torch.int32)
-        parts.append(GPUPartition(
-            counts  = part_counts_f32,
-            lengths = part_len,
-            used    = torch.zeros(len(idx), dtype=torch.bool, device=device),
-            meta    = [meta_all[i] for i in idx.tolist()],
-            indices = idx,
-        ))
-    return parts
+
+def build_sparse_rep(counts_all: torch.Tensor):
+    """Return counts in CSR format and per-row L2 norms (both on CPU)."""
+
+    counts_sparse = counts_all.to_sparse_csr()
+    norms2 = counts_all.pow(2).sum(dim=1)  # (N,)
+    return counts_sparse, norms2
 
 
 # --------------------------------------------------------------------------- #
-# Main greedy loop                                                            #
+# Greedy loop (CPU + sparse)                                                  #
 # --------------------------------------------------------------------------- #
-def greedy_gpu(parts: list[GPUPartition], target: np.ndarray,
-               k_return: int = 8) -> list[int]:
-    """
-    Returns the *global* order (global-sequence indices) in which sequences
-    should be played out.
-    """
-    target_t = torch.as_tensor(target, dtype=torch.float32, device='cuda:0')
+
+
+def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, norms2: torch.Tensor,
+                      target: np.ndarray, k_return: int = 1, error_log_path: str = "") -> list[int]:
+    """Greedy ordering using CPU sparse matrix math (single big matrix)."""
+
+    target_t = torch.as_tensor(target, dtype=torch.float32)
     n_cluster = target.shape[0]
 
-    # Per-cluster cumulative counts as float32 for arithmetic
-    cum_counts = torch.zeros(n_cluster, dtype=torch.float32, device='cuda:0')
+    n_total = counts_all.shape[0]
+    seq_len_const = int(counts_all[0].sum().item())  # sequences are uniform length (2049)
 
-    order: list[int] = []  # global indices
-    n_total = sum(p.counts.shape[0] for p in parts)
+    cum_counts = torch.zeros(n_cluster, dtype=torch.float32)
+    used_mask = torch.zeros(n_total, dtype=torch.bool)
+    order: list[int] = []
 
-    # For progress bar
-    pbar = tqdm(total=n_total, desc='Ordering sequences (GPU)')
+    pbar = tqdm(total=n_total, desc="Ordering sequences (CPU-sparse)")
 
-    seq_len_const = parts[0].lengths[0].item()  # uniform sequence length
+    log_fh = open(error_log_path, "w") if error_log_path else None
 
     while len(order) < n_total:
         desired_remaining = target_t * (n_total * seq_len_const) - cum_counts
-        # Precompute norms for efficient distance calculation
-        d_norm2 = float(desired_remaining.pow(2).sum().item())  # python float for device-agnostic broadcast
+        d_norm2 = float(desired_remaining.pow(2).sum().item())
 
-        best_err: float = float('inf')
-        best_dev   = -1
-        best_local = -1
+        # Sparse matmul for dot products: (N,d) @ (d,) -> (N,)
+        dots = torch.sparse.mm(counts_sparse, desired_remaining.unsqueeze(1)).squeeze(1)
 
-        # Parallel: each GPU returns its k best unused candidates
-        for dev_id, part in enumerate(parts):
-            if (~part.used).sum() == 0:
-                continue
+        errs = norms2 + d_norm2 - 2 * dots
+        errs[used_mask] = float("inf")
 
-            counts_f = part.counts  # (n_seq, n_cluster) float32
+        # k_return allows quick fallback; default 1 for simplicity
+        topk_val, topk_idx = torch.topk(errs, k_return, largest=False)
+        chosen = None
+        for idx in topk_idx:
+            if not used_mask[idx]:
+                chosen = int(idx.item())
+                break
+        if chosen is None:
+            # exhaustive argmin
+            chosen = int(torch.argmin(errs).item())
 
-            # Efficient squared-distance using norms and dot-product to avoid O(nd) memory
-            d_rem = desired_remaining.to(counts_f.device)
-            counts_norm2 = counts_f.pow(2).sum(dim=1)
-            dots = torch.matmul(counts_f, d_rem)
-            errs = counts_norm2 + d_norm2 - 2 * dots
-            errs.masked_fill_(part.used, float('inf'))
+        # Update state
+        used_mask[chosen] = True
+        cum_counts += counts_all[chosen]
+        order.append(chosen)
 
-            # k smallest
-            vals, idxs = torch.topk(errs, k_return, largest=False)
-            for v, i in zip(vals, idxs):
-                err_val = float(v.item())
-                if err_val < best_err:
-                    best_err   = err_val
-                    best_dev   = dev_id
-                    best_local = i.item()
-
-        if best_dev == -1:
-            raise RuntimeError('No selectable sequence found – logic error')
-
-        # Mark chosen
-        chosen_part = parts[best_dev]
-        chosen_part.used[best_local] = True
-
-        # Update globals
-        seq_cnt   = chosen_part.counts[best_local]
-        cum_counts += seq_cnt.to(cum_counts.device)
-        # cum_counts already updated; no need to track total_tokens for error metric
-        global_idx = parts[best_dev].indices[best_local].item()
-        order.append(global_idx)
+        # --- error logging ---
+        if log_fh is not None:
+            total_tokens = len(order) * seq_len_const
+            current_ratio = cum_counts / total_tokens
+            l2_err = torch.norm(current_ratio - target_t, p=2).item()
+            import json as _json
+            log_fh.write(_json.dumps({"step": len(order), "l2": l2_err}) + "\n")
 
         pbar.update(1)
 
     pbar.close()
+    if log_fh is not None:
+        log_fh.close()
     return order
 
 
@@ -258,8 +231,7 @@ def write_output(order: list[int], tokens_all: List[bytes], counts_all: torch.Te
                 ti = tarfile.TarInfo(f'{uid}.tokens.json.gz'); ti.size=len(tb)
                 ci = tarfile.TarInfo(f'{uid}.counts.json.gz'); ci.size=len(cb)
                 tar.addfile(ti, BytesIO(tb)); tar.addfile(ci, BytesIO(cb))
-        manifest.append({'shard_id': shard_id,
-                         'shard_name': shard_path.name,
+        manifest.append({'shard': shard_path.stem,
                          'num_sequences': len(buf_tokens)})
         shard_id += 1
         buf_tokens, buf_counts = [], []
@@ -287,17 +259,20 @@ def write_manifest(manifest: list[Dict], out_dir: Path,
     fout = out_dir / 'manifest.jsonl'
     final_ratio = (cum_counts / tot_tokens).tolist()
     with open(fout, 'w') as f:
-        summary = dict(summary=dict(
-            num_shards      = len(manifest),
-            num_sequences   = sum(m['num_sequences'] for m in manifest),
-            num_tokens      = int(tot_tokens),
-            target_cluster_ratios = target.tolist(),
-            actual_cluster_ratios = final_ratio,
-            total_squared_error   = float(np.square(
-                np.asarray(final_ratio) - target).sum())))
-        f.write(json.dumps(summary) + '\n')
+        # First write shard entries, one per line, so the manifest starts with data samples.
         for m in manifest:
-            f.write(json.dumps(m)+'\n')
+            f.write(json.dumps(m) + '\n')
+
+        # Optionally compute summary stats for console output only (not written to file).
+    summary = dict(
+        num_shards            = len(manifest),
+        num_sequences         = sum(m['num_sequences'] for m in manifest),
+        num_tokens            = int(tot_tokens),
+        target_cluster_ratios = target.tolist(),
+        actual_cluster_ratios = final_ratio,
+        total_squared_error   = float(np.square(np.asarray(final_ratio) - target).sum())
+    )
+    print("Manifest summary:", json.dumps(summary))
     print(f'Wrote manifest to {fout}')
 
 
@@ -308,10 +283,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--input-dir', required=True)
     ap.add_argument('--ratio-file', required=True)
-    ap.add_argument('--output-dir', required=True)
-    ap.add_argument('--counts-dir', required=True,
-                    help="Directory to write counts-only shards (separate dataset)")
-    ap.add_argument('--shard-size', type=int, default=8192,
+    ap.add_argument('--out-dir', required=True,
+                    help="Output directory. Will contain token shards + manifest.jsonl, a 'counts' subdir for counts shards, and error_log.jsonl")
+    ap.add_argument('--shard-size', type=int, default=64,
                     help="Number of sequences per output shard")
     ap.add_argument('--gpus', type=int, default=torch.cuda.device_count(),
                     help='GPUs to use (default: all visible)')
@@ -319,6 +293,7 @@ def main():
                     help='Worker processes for WebLoader streaming')
     ap.add_argument('--loader-prefetch', type=int, default=8,
                     help='Prefetch batches per worker (WebLoader)')
+    # No separate error-log flag; it will be written to <out-dir>/error_log.jsonl automatically
     args = ap.parse_args()
 
     target = read_ratio_file(Path(args.ratio_file))
@@ -336,24 +311,30 @@ def main():
         prefetch=args.loader_prefetch,
     )
 
-    # ------------------------------------------------------------------ distribute to GPUs
-    torch.cuda.empty_cache()
-    parts = split_across_gpus(counts_all, meta_all, args.gpus)
-    print('GPU partitions:', [p.counts.shape[0] for p in parts])
+    # ------------------------------------------------------------------ build sparse representation & greedy order (CPU)
+    counts_sparse, norms2 = build_sparse_rep(counts_all)
 
-    # ------------------------------------------------------------------ greedy order
-    order_indices = greedy_gpu(parts, target)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tokens_dir = out_dir / "tokens"
+    tokens_dir.mkdir(parents=True, exist_ok=True)
+
+    counts_dir = out_dir / "counts"
+
+    error_log_path = str(out_dir / "error_log.jsonl")
+
+    order_indices = greedy_cpu_sparse(counts_all, counts_sparse, norms2, target, k_return=1, error_log_path=error_log_path)
 
     # ------------------------------------------------------------------ write output
-    out_dir = Path(args.output_dir)
-    counts_dir = Path(args.counts_dir)
-    manifest = write_output(order_indices, tokens_all, counts_all, out_dir, counts_dir, args.shard_size)
+    manifest = write_output(order_indices, tokens_all, counts_all, tokens_dir, counts_dir, args.shard_size)
+
+    manifest_path = tokens_dir / 'manifest.jsonl'
 
     # final stats
-    cum = sum(p.counts[p.used].sum(dim=0).to('cpu',dtype=torch.float32)
-              for p in parts).numpy()
-    tot = float(sum(p.counts[p.used].sum().item() for p in parts))
-    write_manifest(manifest, out_dir, target, cum, tot)
+    cum = counts_all[order_indices].sum(dim=0).cpu().numpy()
+    tot = float(cum.sum())
+    write_manifest(manifest, tokens_dir, target, cum, tot)
     print('Done.')
 
 if __name__ == '__main__':

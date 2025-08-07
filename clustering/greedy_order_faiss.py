@@ -49,6 +49,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 import webdataset as wds
+import faiss  # Facebook AI similarity search
 
 
 # --------------------------------------------------------------------------- #
@@ -131,102 +132,90 @@ def stream_shards_to_arrays(
 
 
 # --------------------------------------------------------------------------- #
-# GPU helper                                                                  #
+# Build Faiss multi-GPU HNSW index                                            #
 # --------------------------------------------------------------------------- #
-@dataclass
-class GPUPartition:
-    counts  : torch.Tensor  # (n_seq, n_cluster) float32 (tokens per cluster)
-    lengths : torch.Tensor  # (n_seq,)  int32  (total tokens per seq)
-    used    : torch.Tensor  # (n_seq,)  bool
-    meta    : list[SequenceMeta]
-    indices : np.ndarray   # global indices
 
-def split_across_gpus(counts_all: torch.Tensor, meta_all: list[SequenceMeta], ngpu: int) -> list[GPUPartition]:
-    parts: list[GPUPartition] = []
-    idxs = np.array_split(np.arange(counts_all.shape[0]), ngpu)
-    for dev_id, idx in enumerate(idxs):
-        device = f'cuda:{dev_id}'
-        idx_list = idx.tolist()
-        part_counts_f32 = counts_all[idx_list].to(device=device, dtype=torch.float32)
-        part_len        = part_counts_f32.sum(dim=1, dtype=torch.int32)
-        parts.append(GPUPartition(
-            counts  = part_counts_f32,
-            lengths = part_len,
-            used    = torch.zeros(len(idx), dtype=torch.bool, device=device),
-            meta    = [meta_all[i] for i in idx.tolist()],
-            indices = idx,
-        ))
-    return parts
+def build_faiss_index(counts_all: torch.Tensor, M: int, ef_construction: int, ngpu: int):
+    """Return a faiss.Index distributed across GPUs (shards) using HNSW."""
+
+    # Convert to NumPy float32 for Faiss
+    counts_np = counts_all.cpu().numpy().astype("float32", copy=False)
+    d = counts_np.shape[1]
+
+    index_cpu = faiss.IndexHNSWFlat(d, M)
+    index_cpu.hnsw.efConstruction = ef_construction
+    index_cpu.verbose = False
+    # Add vectors in batches to reduce memory spikes
+    batch = 1024
+    for i in tqdm(range(0, counts_np.shape[0], batch), desc="Adding vectors to Faiss"):
+        index_cpu.add(counts_np[i : i + batch])
+
+    # Shard index across GPUs
+    res = [faiss.StandardGpuResources() for _ in range(ngpu)]
+    gpu_index = faiss.index_cpu_to_gpus_list(index_cpu, res, list(range(ngpu)))
+    return gpu_index
 
 
 # --------------------------------------------------------------------------- #
 # Main greedy loop                                                            #
 # --------------------------------------------------------------------------- #
-def greedy_gpu(parts: list[GPUPartition], target: np.ndarray,
-               k_return: int = 8) -> list[int]:
-    """
-    Returns the *global* order (global-sequence indices) in which sequences
-    should be played out.
-    """
+def greedy_faiss(counts_all: torch.Tensor, target: np.ndarray, ngpu: int, k_return: int = 8,
+                 M: int = 32, ef_construction: int = 40, ef_search: int = 128) -> list[int]:
+    """Greedy ordering using a Faiss multi-GPU HNSW index."""
+
     target_t = torch.as_tensor(target, dtype=torch.float32, device='cuda:0')
     n_cluster = target.shape[0]
 
-    # Per-cluster cumulative counts as float32 for arithmetic
+    # Build index (CPU -> GPUs)
+    index = build_faiss_index(counts_all, M=M, ef_construction=ef_construction, ngpu=ngpu)
+    index.hnsw.efSearch = ef_search
+
     cum_counts = torch.zeros(n_cluster, dtype=torch.float32, device='cuda:0')
+    seq_len_const = 2049  # constant sequence length
 
-    order: list[int] = []  # global indices
-    n_total = sum(p.counts.shape[0] for p in parts)
+    n_total = counts_all.shape[0]
+    order: list[int] = []
 
-    # For progress bar
-    pbar = tqdm(total=n_total, desc='Ordering sequences (GPU)')
+    pbar = tqdm(total=n_total, desc="Ordering sequences (Faiss)")
 
-    seq_len_const = parts[0].lengths[0].item()  # uniform sequence length
+    used_mask = np.zeros(n_total, dtype=bool)
+
+    counts_all_cuda = counts_all.to(device='cuda:0')  # for cum_counts updates
 
     while len(order) < n_total:
         desired_remaining = target_t * (n_total * seq_len_const) - cum_counts
-        # Precompute norms for efficient distance calculation
-        d_norm2 = float(desired_remaining.pow(2).sum().item())  # python float for device-agnostic broadcast
 
-        best_err: float = float('inf')
-        best_dev   = -1
-        best_local = -1
+        # Query faiss with the desired vector
+        query = desired_remaining.cpu().numpy().astype('float32').reshape(1, -1)
+        D, I = index.search(query, k_return)
+        candidates = I[0]
 
-        # Parallel: each GPU returns its k best unused candidates
-        for dev_id, part in enumerate(parts):
-            if (~part.used).sum() == 0:
+        chosen = -1
+        for idx in candidates:
+            if idx < 0:
                 continue
+            if not used_mask[idx]:
+                chosen = int(idx)
+                break
 
-            counts_f = part.counts  # (n_seq, n_cluster) float32
+        if chosen == -1:
+            # Fallback: search more neighbors
+            D, I = index.search(query, k_return * 4)
+            for idx in I[0]:
+                if idx >= 0 and not used_mask[idx]:
+                    chosen = int(idx)
+                    break
+            if chosen == -1:
+                raise RuntimeError("No selectable sequence found – logic error (faiss)")
 
-            # Efficient squared-distance using norms and dot-product to avoid O(nd) memory
-            d_rem = desired_remaining.to(counts_f.device)
-            counts_norm2 = counts_f.pow(2).sum(dim=1)
-            dots = torch.matmul(counts_f, d_rem)
-            errs = counts_norm2 + d_norm2 - 2 * dots
-            errs.masked_fill_(part.used, float('inf'))
+        # Mark as used and remove from index
+        used_mask[chosen] = True
+        idx_remove = np.array([chosen], dtype='int64')
+        index.remove_ids(idx_remove)
 
-            # k smallest
-            vals, idxs = torch.topk(errs, k_return, largest=False)
-            for v, i in zip(vals, idxs):
-                err_val = float(v.item())
-                if err_val < best_err:
-                    best_err   = err_val
-                    best_dev   = dev_id
-                    best_local = i.item()
-
-        if best_dev == -1:
-            raise RuntimeError('No selectable sequence found – logic error')
-
-        # Mark chosen
-        chosen_part = parts[best_dev]
-        chosen_part.used[best_local] = True
-
-        # Update globals
-        seq_cnt   = chosen_part.counts[best_local]
-        cum_counts += seq_cnt.to(cum_counts.device)
-        # cum_counts already updated; no need to track total_tokens for error metric
-        global_idx = parts[best_dev].indices[best_local].item()
-        order.append(global_idx)
+        # Update cum_counts and order
+        cum_counts += counts_all_cuda[chosen]
+        order.append(chosen)
 
         pbar.update(1)
 
@@ -314,7 +303,10 @@ def main():
     ap.add_argument('--shard-size', type=int, default=8192,
                     help="Number of sequences per output shard")
     ap.add_argument('--gpus', type=int, default=torch.cuda.device_count(),
-                    help='GPUs to use (default: all visible)')
+                    help='GPUs to use for Faiss index (default: all visible)')
+    ap.add_argument('--hnsw-M', type=int, default=32, help='HNSW M parameter')
+    ap.add_argument('--hnsw-ef-construction', type=int, default=40, help='HNSW efConstruction')
+    ap.add_argument('--hnsw-ef-search', type=int, default=128, help='HNSW efSearch during queries')
     ap.add_argument('--loader-workers', type=int, default=8,
                     help='Worker processes for WebLoader streaming')
     ap.add_argument('--loader-prefetch', type=int, default=8,
@@ -336,13 +328,11 @@ def main():
         prefetch=args.loader_prefetch,
     )
 
-    # ------------------------------------------------------------------ distribute to GPUs
+    # ------------------------------------------------------------------ greedy order with Faiss HNSW
     torch.cuda.empty_cache()
-    parts = split_across_gpus(counts_all, meta_all, args.gpus)
-    print('GPU partitions:', [p.counts.shape[0] for p in parts])
-
-    # ------------------------------------------------------------------ greedy order
-    order_indices = greedy_gpu(parts, target)
+    order_indices = greedy_faiss(counts_all, target, args.gpus, k_return=8,
+                                 M=args.hnsw_M, ef_construction=args.hnsw_ef_construction,
+                                 ef_search=args.hnsw_ef_search)
 
     # ------------------------------------------------------------------ write output
     out_dir = Path(args.output_dir)
@@ -350,9 +340,8 @@ def main():
     manifest = write_output(order_indices, tokens_all, counts_all, out_dir, counts_dir, args.shard_size)
 
     # final stats
-    cum = sum(p.counts[p.used].sum(dim=0).to('cpu',dtype=torch.float32)
-              for p in parts).numpy()
-    tot = float(sum(p.counts[p.used].sum().item() for p in parts))
+    cum = counts_all[order_indices].sum(dim=0).cpu().numpy()
+    tot = float(cum.sum())
     write_manifest(manifest, out_dir, target, cum, tot)
     print('Done.')
 
