@@ -166,11 +166,13 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
     log_fh = open(error_log_path, "w") if error_log_path else None
 
     while len(order) < n_total:
-        desired_remaining = target_t * (n_total * seq_len_const) - cum_counts
-        d_norm2 = float(desired_remaining.pow(2).sum().item())
+        tokens_after_step = (len(order) + 1) * seq_len_const
+        desired_next_total = target_t * tokens_after_step
+        residual_for_choice = desired_next_total - cum_counts
+        d_norm2 = float(residual_for_choice.pow(2).sum().item())
 
         # Sparse matmul for dot products: (N,d) @ (d,) -> (N,)
-        dots = torch.sparse.mm(counts_sparse, desired_remaining.unsqueeze(1)).squeeze(1)
+        dots = torch.sparse.mm(counts_sparse, residual_for_choice.unsqueeze(1)).squeeze(1)
 
         errs = norms2 + d_norm2 - 2 * dots
         errs[used_mask] = float("inf")
@@ -216,32 +218,30 @@ def write_output(order: list[int], tokens_all: List[bytes], counts_all: torch.Te
     counts_dir.mkdir(parents=True, exist_ok=True)
     manifest: list[Dict] = []
     shard_id = 0
-    buf_tokens, buf_counts = [], []
+    buf_tokens = []
 
     def flush():
-        nonlocal shard_id, buf_tokens, buf_counts
+        nonlocal shard_id, buf_tokens
         if not buf_tokens:
             return
         shard_path = out_sequences_dir / f'shard_{shard_id:08d}.tar'
         with tarfile.open(shard_path, 'w') as tar:
-            for tok, cnt in zip(buf_tokens, buf_counts):
+            for tok in buf_tokens:
                 uid = uuid.uuid4().hex
                 tb = tok  # already gzipped bytes from source
-                cb = gzip.compress(json.dumps([int(x) for x in cnt]).encode())
-                ti = tarfile.TarInfo(f'{uid}.tokens.json.gz'); ti.size=len(tb)
-                ci = tarfile.TarInfo(f'{uid}.counts.json.gz'); ci.size=len(cb)
-                tar.addfile(ti, BytesIO(tb)); tar.addfile(ci, BytesIO(cb))
+                ti = tarfile.TarInfo(f'{uid}.json.gz'); ti.size = len(tb)
+                tar.addfile(ti, BytesIO(tb))
         manifest.append({'shard': shard_path.stem,
                          'num_sequences': len(buf_tokens)})
         shard_id += 1
-        buf_tokens, buf_counts = [], []
+        buf_tokens = []
 
     counts_writer = wds.ShardWriter(str(counts_dir / "shard_%08d.tar"), maxcount=chunk, encoder=False)
 
     for idx in order:
         tok_bytes = tokens_all[idx]
         cnt = counts_all[idx].to(dtype=torch.int32, device='cpu').tolist()
-        buf_tokens.append(tok_bytes); buf_counts.append(cnt)
+        buf_tokens.append(tok_bytes)
 
         # Write counts sample immediately via ShardWriter to avoid big memory
         uid = uuid.uuid4().hex

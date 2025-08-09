@@ -43,13 +43,13 @@ creation, which itself mirrors the order of the input documents.
 Example
 -------
     python ordered_tokenize.py \
-        --input-dir /datasets/dclm-baseline-1.0 \
+        --input-dir  /datasets/dclm-baseline-1.0 \
         --output-dir /tmp/ordered_shards \
-        --tokenizer-eleuther-path EleutherAI_gpt-neox-20b.tiktoken
+        --tokenizer-name EleutherAI/gpt-neox-20b
 
 Requirements
 ------------
-``pip install numpy tqdm tiktoken``
+``pip install numpy tqdm transformers``
 """
 import argparse
 import gzip
@@ -60,19 +60,23 @@ from io import BytesIO
 from pathlib import Path
 from typing import Callable, Iterator, List, Tuple
 
+# ---------------------------------------------------------------------------
+# External deps
+# ---------------------------------------------------------------------------
+
 import numpy as np
 from tqdm import tqdm
 # Added for simple parallel processing
-import multiprocessing as mp
 import torch  # Added for saving counts tensors alongside shards
 
+# Hugging-Face fast tokenizer (Rust backend)
 try:
-    # tiktoken is preferred – identical to the Rust implementation
-    import tiktoken  # type: ignore
-except ImportError as e:
-    raise SystemExit("tiktoken package not found. Install with `pip install tiktoken`." ) from e
+    from transformers import AutoTokenizer  # type: ignore
+except ImportError as e:  # nocov
+    raise SystemExit(
+        "transformers package not found. Install with `pip install transformers`.") from e
 
-# Optional but recommended for .zstd support
+# Optional but recommended for .zstd support (kept optional to avoid hard dep)
 try:
     import zstandard as zstd  # type: ignore
 except ImportError:
@@ -80,60 +84,20 @@ except ImportError:
 
 
 ###############################################################################
-# Tokenizer helpers
+# Tokenizer helper
 ###############################################################################
 
 
-def load_tiktoken_from_file(tiktoken_path: Path, regex_pattern: str):
-    """Load a CoreBPE from a raw *.tiktoken* file.
-
-    The format matches that used by the Rust implementation.
-    """
-
-    from tiktoken.core_bpe import CoreBPE  # pyright: ignore
-
-    encoder = {}
-    with open(tiktoken_path, "r", encoding="utf-8") as fh:
-        for line in fh:
-            raw, rank = line.strip().split(" ")
-            # we cannot rely on base64 from tiktoken internal. Use python stdlib
-            import base64
-
-            token_bytes = base64.b64decode(raw)
-            encoder[token_bytes] = int(rank)
-
-    return CoreBPE(encoder, {}, regex_pattern)
-
-
 def build_tokenizer(args: argparse.Namespace):
-    """Return (encode_fn, vocab_size) pair."""
+    """Return (encode_fn, vocab_size) using Hugging-Face fast tokenizer."""
 
-    if args.tokenizer_eleuther_path:
-        # Build CoreBPE from provided *.tiktoken* file
-        enc_name = args.tokenizer_name
-        if enc_name == "EleutherAI/gpt-neox-20b":
-            regex_pattern = (
-                r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
-            )
-            core_bpe = load_tiktoken_from_file(Path(args.tokenizer_eleuther_path), regex_pattern)
-            # Create encoding function that allows special tokens, matching Rust behavior
-            def encode_fn(text):
-                return core_bpe.encode(text, allowed_special="all")
-            return encode_fn, 50254  # GPT-NeoX vocab size
-        else:
-            raise ValueError(
-                "Custom *.tiktoken* loading currently supported only for EleutherAI/gpt-neox-20b"
-            )
-    else:
-        # Fallback – attempt to load via tiktoken's built-in encodings
-        try:
-            enc: tiktoken.Encoding = tiktoken.encoding_for_model("gpt-neox")
-        except KeyError:
-            enc = tiktoken.get_encoding("gpt2")
-        # Create encoding function that allows special tokens, matching Rust behavior
-        def encode_fn(text):
-            return enc.encode(text, allowed_special="all")
-        return encode_fn, enc.n_vocab
+    tok = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True)
+
+    # Disable automatic BOS/EOS insertion – we append our own EOT token.
+    def encode_fn(text: str):
+        return tok.encode(text, add_special_tokens=False)
+
+    return encode_fn, tok.vocab_size
 
 
 ###############################################################################
@@ -330,13 +294,13 @@ def main():
     parser = argparse.ArgumentParser(description="Ordered tokenizer & sharder with cluster counts")
     parser.add_argument("--input-dir", type=str, required=True, help="Directory containing jsonl(.zstd) shards")
     parser.add_argument("--output-dir", type=str, required=True, help="Directory to place output .tar shards")
-    parser.add_argument("--tokenizer-name", type=str, default="EleutherAI/gpt-neox-20b", help="Tokenizer id (informational)")
-    parser.add_argument("--tokenizer-eleuther-path", type=str, default="", help="Optional path to *.tiktoken file for EleutherAI/gpt-neox-20b")
-    parser.add_argument("--n-chunks", type=int, default=1, help="Number of output chunk directories to create (split shards evenly)")
+    parser.add_argument("--tokenizer-name", type=str, default="EleutherAI/gpt-neox-20b", help="Any Hugging-Face tokenizer id")
+    parser.add_argument("--n-chunks", type=int, default=1, help="Total number of chunks in the global split")
+    parser.add_argument("--chunk", type=int, default=0, help="Zero-based index of the chunk this process should handle")
     args = parser.parse_args()
 
     # Build a tokenizer once in the main process (informational)
-    _, vocab_size = build_tokenizer(args)
+    encode_fn, vocab_size = build_tokenizer(args)
     print(f"Loaded tokenizer (vocab size {vocab_size})")
 
     input_dir = Path(args.input_dir)
@@ -347,62 +311,27 @@ def main():
     print(f"Detected {num_clusters} clusters across shards")
 
     num_chunks = max(1, args.n_chunks)
+    if args.chunk < 0 or args.chunk >= num_chunks:
+        raise ValueError(f"--chunk must be in [0, {num_chunks}) but got {args.chunk}")
+
     chunk_size = (len(all_pairs) + num_chunks - 1) // num_chunks  # ceil division
 
-    def _worker(jsonl_path: str, clusters_path: str, dest_dir: Path):  # type: ignore
-        """Process one shard pair in a separate process."""
+    chunk_idx = args.chunk
+    start = chunk_idx * chunk_size
+    end = min(start + chunk_size, len(all_pairs))
+    chunk_pairs = all_pairs[start:end]
+    print(f"Processing chunk {chunk_idx}/{num_chunks}: indices [{start}, {end}) of {len(all_pairs)} total shards")
 
-        worker_args = argparse.Namespace(
-            tokenizer_name=args.tokenizer_name,
-            tokenizer_eleuther_path=args.tokenizer_eleuther_path,
-        )
-        encode_fn, _ = build_tokenizer(worker_args)
-        writer = SequenceWriter(dest_dir, num_clusters)
-        process_pair(Path(jsonl_path), Path(clusters_path), encode_fn, writer)
-        writer.close()
+    chunk_out_root = output_dir / f"sub{chunk_idx}"
+    chunk_out_root.mkdir(parents=True, exist_ok=True)
 
-    shard_counter_global = 0
+    # Single-process: one writer; process pairs sequentially
+    writer = SequenceWriter(chunk_out_root, num_clusters)
+    for j_path, c_path in tqdm(chunk_pairs, desc=f"Chunk {chunk_idx}: processing", leave=False):
+        process_pair(Path(j_path), Path(c_path), encode_fn, writer)
+    writer.close()
 
-    for chunk_idx in range(num_chunks):
-        start = chunk_idx * chunk_size
-        end = min(start + chunk_size, len(all_pairs))
-        chunk_pairs = all_pairs[start:end]
-
-        chunk_out_root = output_dir / f"sub{chunk_idx}"
-        chunk_out_root.mkdir(parents=True, exist_ok=True)
-
-        # Spawn processes for this chunk
-        processes: List[mp.Process] = []
-        for local_idx, (j_path, c_path) in enumerate(chunk_pairs):
-            dest_dir = chunk_out_root / f"part_{local_idx:05d}"
-            p = mp.Process(target=_worker, args=(str(j_path), str(c_path), dest_dir))
-            p.start()
-            processes.append(p)
-
-        for p in tqdm(processes, desc=f"Chunk {chunk_idx}: processing", leave=False):
-            p.join()
-
-        # Concatenate within this chunk directory
-        shard_counter = 0
-        for part_dir in sorted(chunk_out_root.glob("part_*")):
-            for tar_path in sorted(part_dir.glob("*.tar")):
-                target_path = chunk_out_root / f"shard_{shard_counter:08d}.tar"
-                tar_path.rename(target_path)
-
-                counts_src = tar_path.with_suffix("").with_name(f"{tar_path.stem}_counts.pt")
-                if counts_src.exists():
-                    counts_dst = chunk_out_root / f"shard_{shard_counter:08d}_counts.pt"
-                    counts_src.rename(counts_dst)
-                shard_counter += 1
-            # cleanup part dir
-            try:
-                part_dir.rmdir()
-            except OSError:
-                pass
-
-        shard_counter_global += shard_counter
-
-    print(f"Done. Wrote {shard_counter_global} tar shards across {num_chunks} chunk directories.")
+    print(f"Done. Wrote {writer.shard_id} tar shards in chunk directory sub{chunk_idx}.")
 
 
 if __name__ == "__main__":
