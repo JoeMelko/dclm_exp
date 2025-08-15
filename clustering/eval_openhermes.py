@@ -5,6 +5,12 @@ eval_openhermes.py
 Compute the token-level cross-entropy loss (and perplexity) of an Open-LM
 checkpoint – identified by its Datacomp-LM run UUID – on the tokenised
 OpenHermes WebDataset.
+
+Supports efficient approximate evaluation by loading a larger full batch
+(`--full-batch-size`) and randomly subsampling `--batch-size` examples within
+that batch to run the model forward pass. The remaining examples are discarded.
+This reduces compute while preserving an unbiased estimate over the sampled
+subset.
 """
 import argparse, json, math, io
 from pathlib import Path
@@ -113,26 +119,38 @@ def collate(batch):
 @torch.inference_mode()
 def evaluate(model: torch.nn.Module,
              loader: torch.utils.data.DataLoader,
-             device: torch.device) -> float:
+             device: torch.device,
+             sample_batch_size: int) -> float:
     total_loss, total_tokens = 0.0, 0
     tmp_loss, tmp_tokens = 0.0, 0
     ct = 0
     for toks, labels in tqdm.tqdm(loader, desc="Evaluating"):
-        toks, labels = toks.to(device), labels.to(device)
+        # Subsample a random subset of examples from the full batch
+        full_bs = toks.size(0)
+        use_bs = min(sample_batch_size, full_bs)
+        if use_bs < full_bs:
+            perm = torch.randperm(full_bs, device=toks.device)
+            idx = perm[:use_bs]
+            toks_sub = toks.index_select(0, idx)
+            labels_sub = labels.index_select(0, idx)
+        else:
+            toks_sub, labels_sub = toks, labels
+
+        toks_sub, labels_sub = toks_sub.to(device), labels_sub.to(device)
         with autocast(dtype=torch.bfloat16):
-            out = model(input_ids=toks, labels=labels)
-        # `out.loss` is mean over non-ignored labels within the batch
-        n_tokens = (labels != -100).sum().item()
+            out = model(input_ids=toks_sub, labels=labels_sub)
+        # `out.loss` is mean over non-ignored labels within the sub-batch
+        n_tokens = (labels_sub != -100).sum().item()
         total_loss   += out.loss.item() * n_tokens
         total_tokens += n_tokens
         tmp_loss += out.loss.item() * n_tokens
         tmp_tokens += n_tokens
         ct += 1
-        if ct % 500 == 0:
+        if ct % 500 == 0 and tmp_tokens > 0:
             print(tmp_loss / tmp_tokens)
             tmp_loss, tmp_tokens = 0.0, 0
-        if ct > 30000:
-            break
+    if total_tokens == 0:
+        return float("nan")
     return total_loss / total_tokens
 
 
@@ -156,12 +174,12 @@ def main(args):
 
     ds = wds.WebDataset([str(p) for p in shards])
     loader = wds.WebLoader(ds,
-                           batch_size=args.batch_size,
+                           batch_size=args.full_batch_size,
                            num_workers=8,
                            collate_fn=collate)
 
     # ----- evaluation ----------------------------------------------------- #
-    loss = evaluate(model, loader, device)
+    loss = evaluate(model, loader, device, sample_batch_size=args.batch_size)
     print(f"Cross-entropy loss: {loss:.6f}\nPerplexity       : {math.exp(loss):.6f}")
 
 
@@ -173,5 +191,7 @@ if __name__ == "__main__":
     parser.add_argument("--uuid", required=True,
                         help="Datacomp-LM / Open-LM run UUID identifying the checkpoint to evaluate")
     parser.add_argument("--batch-size", type=int, default=16,
-                        help="Evaluation batch size (default: 16)")
+                        help="Number of examples to subsample per full batch for the forward pass (default: 16)")
+    parser.add_argument("--full-batch-size", type=int, default=256,
+                        help="Full batch size to load/collate before subsampling (default: 64)")
     main(parser.parse_args())
