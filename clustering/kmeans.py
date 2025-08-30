@@ -45,7 +45,6 @@ def load_embeddings(path):
 
     if ext in {".npy", ".npz"}:
         arr = np.asarray(np.load(path))
-        breakpoint()
         # np.load on .npz returns a dict-like object; grab the first array
         if not isinstance(arr, np.ndarray):
             key = list(arr.keys())[0]
@@ -97,6 +96,10 @@ def train_kmeans(memmap, n_clusters, sample, seed=0):
 def assign_chunks(memmap, centroids, chunk, out_path, plot_path=None):
     """Assign every vector to its nearest centroid using GPUs.
 
+    Output format is inferred from the extension of ``out_path``:
+      • ``.npy`` → writes a 1D NumPy array of dtype int32 where index == row_id
+      • other (e.g. ``.tsv``) → writes tab-separated ``row_id\tcluster_id`` lines
+
     Each chunk is converted to a CUDA tensor (float32) which avoids the
     single-threaded NumPy → GPU copy bottleneck and leverages FAISS' tensor
     interface enabled by importing faiss.contrib.torch_utils.
@@ -116,7 +119,14 @@ def assign_chunks(memmap, centroids, chunk, out_path, plot_path=None):
 
     counts = np.zeros(centroids.shape[0], dtype=np.int64)
 
-    with open(out_path, "w") as fh:
+    write_npy = out_path.lower().endswith(".npy")
+    labels_arr = np.empty(N, dtype=np.int32) if write_npy else None
+
+    fh = None
+    try:
+        if not write_npy:
+            fh = open(out_path, "w")
+
         for base in tqdm.trange(0, N, chunk, desc="assign"):
             # Slice fp16 view, then move to GPU and cast to fp32 in one call
             if isinstance(memmap, torch.Tensor):
@@ -134,8 +144,18 @@ def assign_chunks(memmap, centroids, chunk, out_path, plot_path=None):
             labs_np = labs.cpu().numpy().ravel()
             # Bring labels back to CPU for writing & counting
             counts += np.bincount(labs_np, minlength=counts.size)
-            for i, c in enumerate(labs_np):
-                fh.write(f"{base + i}\t{c}\n")
+
+            if write_npy:
+                labels_arr[base:base + labs_np.size] = labs_np
+            else:
+                for i, c in enumerate(labs_np):
+                    fh.write(f"{base + i}\t{c}\n")
+    finally:
+        if fh is not None:
+            fh.close()
+
+    if write_npy:
+        np.save(out_path, labels_arr)
 
     # Plot distribution if requested
     if plot_path is not None:
