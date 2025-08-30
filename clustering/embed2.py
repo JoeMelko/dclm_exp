@@ -4,16 +4,30 @@ embed_datacomp_qwen3.py
 -----------------------
 Stream Datacomp‑LM (baseline global‑1 / local‑1, 279 *.jsonl.zstd shards),
 embed the `text` field with Qwen/Qwen3‑Embedding‑0.6B, and store
-a single `.npy` matrix whose rows exactly follow source order.
+either a single `.npy` matrix (default) or a raw fp16 binary (`--raw_out`),
+whose rows exactly follow source order.
 
-Launch on one 8‑GPU node:
+Launch on one 8‑GPU node (example):
 
   torchrun --standalone --nproc_per_node 8 \
       clustering/embed2.py \
       --data_dir   /mnt/one/home/jmelko/dclm_exp/data/gs01_ls1 \
       --out_dir    /mnt/one/home/jmelko/dclm_exp/data/gs01_ls1/embeddings \
       --batch_size 64 \
-      --max_len    1024
+      --max_len    1024 \
+      --workers    4 \
+      --fp16             # optional: run model in fp16 (default bf16) \
+      --raw_out          # optional: write raw fp16 .fp16 instead of .npy
+
+Flags
+-----
+--data_dir   PATH   Directory of input shards (expects shard_*_processed.jsonl.zstd)
+--out_dir    PATH   Output directory (created if missing)
+--batch_size INT    Per‑GPU batch size (default: 64)
+--max_len    INT    Max tokens for truncation (default: 1024)
+--workers    INT    DataLoader workers per process (default: 4)
+--fp16              Use fp16 compute (default: bf16)
+--raw_out           Save final embeddings as raw fp16 binary (.fp16). By default writes .npy
 """
 
 from __future__ import annotations
@@ -117,6 +131,8 @@ def main():
     ap.add_argument("--max_len",    type=int, default=1024)
     ap.add_argument("--workers",    type=int, default=4)
     ap.add_argument("--fp16",       action="store_true")
+    ap.add_argument("--raw_out",    action="store_true",
+                    help="Write final embeddings as raw fp16 binary (row-major) for torch.from_file.")
     args = ap.parse_args()
 
     rank, world = ddp_init()
@@ -205,9 +221,17 @@ def main():
             idx = uniq_idx
 
         order = idx.argsort(kind="mergesort")
-        final = Path(args.out_dir) / "datacomp_glob1_local1_qwen3_0.6B.npy"
-        np.save(final, emb[order])
-        print(f"[rank-0] ✅ All done. Final matrix -> {final}")
+        sorted_emb = emb[order]
+
+        if args.raw_out:
+            # Write raw fp16 binary, row-major. Compatible with torch.from_file in kmeans.py
+            final_raw = Path(args.out_dir) / "datacomp_glob1_local1_qwen3_0.6B.fp16"
+            sorted_emb.astype(np.float16, copy=False).tofile(final_raw)
+            print(f"[rank-0] ✅ All done. Final raw fp16 matrix -> {final_raw}")
+        else:
+            final_npy = Path(args.out_dir) / "datacomp_glob1_local1_qwen3_0.6B.npy"
+            np.save(final_npy, sorted_emb)
+            print(f"[rank-0] ✅ All done. Final matrix -> {final_npy}")
 
         # Clean up per-rank temporary files.
         for f in tmp_files:
