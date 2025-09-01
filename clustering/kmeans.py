@@ -1,13 +1,75 @@
 #!/usr/bin/env python
 """
-Cluster ~30M fp16 embeddings (1024‑D) into 10 k clusters with FAISS GPU K‑means
-and write a mapping row_id -> cluster_id (tab‑separated).
+Cluster large embedding matrices with FAISS spherical K‑means on GPU and write
+the mapping row_id -> cluster_id.
 
+Usage:
+  python kmeans.py --embeddings PATH --n-clusters K --sample N --chunk M --out OUTPUT
+
+Inputs (embeddings):
+  - .npy: NumPy array of shape (N, 1024), dtype float16/float32 (memory-mapped when possible)
+  - .npz: First array in the archive is used; must be shape (N, 1024)
+  - Raw binary fp16: Row-major float16 file containing (N x 1024) vectors; N is
+    inferred from file size. 1024 dimensions are assumed.
+
+Processing pipeline:
+  - Embeddings are upcast to float32 and L2-normalised in memory
+  - K‑means is trained on a random sample of size --sample using FAISS with
+    spherical=True (cosine-distance k‑means)
+  - All vectors are assigned on the GPU in chunks of size --chunk
+
+Outputs (out):
+  - If OUTPUT ends with .npy: saves a 1D int32 array where labels[i] is the
+    cluster id for row i
+  - Otherwise (e.g., .tsv): writes lines of the form "row_id\tcluster_id"
+  - Also writes a cluster-size histogram PNG next to OUTPUT as OUTPUT_hist.png
+
+Arguments:
+  --embeddings PATH     Path to .npy, .npz, or raw fp16 binary (N x 1024)
+  --n-clusters K        Number of clusters (default: 10000)
+  --sample N            Number of points to sample for training (default: 3,000,000)
+  --chunk M             Assignment chunk size for GPU (default: 1,000,000)
+  --out OUTPUT          Output path (.npy for label array, or .tsv for text)
+
+Requirements:
+  - CUDA-capable GPU and faiss-gpu installed
+  - PyTorch (for tensor interop and normalisation), NumPy, tqdm, matplotlib
+
+Examples:
+  # .npy → .npy labels
   python kmeans.py \
-         --embeddings embeddings/datacomp_glob1_local1_qwen3_0.6B.npy \
-         --n-clusters 10000 \
-         --sample 10000000 \
-         --out clusters.tsv
+    --embeddings embeddings/my_embeds.npy \
+    --n-clusters 10000 \
+    --sample 10000000 \
+    --chunk 1000000 \
+    --out clusters.npy
+
+  # .npy → .tsv labels
+  python kmeans.py \
+    --embeddings embeddings/my_embeds.npy \
+    --n-clusters 5000 \
+    --sample 3000000 \
+    --out clusters.tsv
+
+  # .npz input (first array used) → .npy labels
+  python kmeans.py \
+    --embeddings embeddings/my_embeds.npz \
+    --n-clusters 8000 \
+    --sample 5000000 \
+    --out clusters.npy
+
+  # raw fp16 binary (N x 1024) → .tsv labels
+  python kmeans.py \
+    --embeddings embeddings/my_embeds.fp16 \
+    --n-clusters 10000 \
+    --sample 10000000 \
+    --out clusters.tsv
+
+Notes:
+  - Increase --chunk if GPU memory allows for faster assignment; decrease to
+    avoid OOM
+  - Ensure --sample ≤ N; larger samples improve quality at the cost of time
+  - Script assumes 1024‑D vectors; adjust load_embeddings() if your dimension differs
 """
 import argparse, os, time, numpy as np, faiss, torch, tqdm, matplotlib.pyplot as plt
 # Enable FAISS <-> PyTorch tensor interoperability (search/index functions accept tensors)
