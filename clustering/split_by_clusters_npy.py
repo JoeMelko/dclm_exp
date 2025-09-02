@@ -88,14 +88,17 @@ def stream_split(
     compressors: Dict[int, zstd.ZstdCompressor] = {}
 
     # Process each shard; writers are scoped to a single shard and closed after
-    for in_path in tqdm(shards, desc="shards"):
+    for in_path in shards:
         rel_path = in_path.relative_to(input_dir)
         dctx = zstd.ZstdDecompressor()
         writers: Dict[Tuple[int, Path], io.BufferedWriter] = {}
 
         with in_path.open("rb") as fin, dctx.stream_reader(fin) as reader:
             text_stream = io.TextIOWrapper(reader, encoding="utf-8")
-            for line in text_stream:
+            for line in tqdm(text_stream, desc="lines"):
+                '''ct += 1
+                if ct % 10_000 == 0:
+                    print(f"Processed {ct} lines")'''
                 # Replicate embed2.py's validity criterion: JSON with 'text' key
                 is_valid = False
                 try:
