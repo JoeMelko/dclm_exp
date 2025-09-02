@@ -49,7 +49,8 @@ Parent directory::
         --input-root   clusters_parent_dir \
         --counts-json  n_per_cluster.json  \
         --output-dir   merged_balanced_ds  \
-        --seed         42
+        --seed         42 \
+        --shard-size   64
 
 ``n_per_cluster.json`` must map *directory basenames* to integers, e.g.::
 
