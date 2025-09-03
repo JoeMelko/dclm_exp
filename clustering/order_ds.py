@@ -216,6 +216,7 @@ def assemble_dataset(
     out_dir: Path,
     maxcount: int,
     seed: int,
+    order: str = "jittered",
 ):
     rng = np.random.default_rng(seed)
 
@@ -250,7 +251,10 @@ def assemble_dataset(
     # a running integer index.
     linear_sample_ids = list(range(len(sample_ids)))
 
-    order = nested_jittered_order(cluster_ids, linear_sample_ids, seed=seed)
+    if order == "random":
+        order = rng.permutation(len(sample_ids))
+    else:
+        order = nested_jittered_order(cluster_ids, linear_sample_ids, seed=seed)
 
     print("🧮  Final permutation length:", len(order))
 
@@ -308,6 +312,8 @@ def main(argv: List[str] | None = None):
                    help="Maximum #samples per output shard (ShardWriter). Alias: --shard-size")
     p.add_argument("--seed", type=int, required=True,
                    help="Global RNG seed")
+    p.add_argument("--order", choices=["jittered", "random"], default="jittered",
+                   help="Ordering of merged samples: balanced 'jittered' (default) or fully 'random'")
 
     args = p.parse_args(argv)
 
@@ -330,6 +336,7 @@ def main(argv: List[str] | None = None):
         out_dir=args.output_dir,
         maxcount=args.maxcount,
         seed=args.seed,
+        order=args.order,
     )
 
 
