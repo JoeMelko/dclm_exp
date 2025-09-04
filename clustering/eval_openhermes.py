@@ -12,7 +12,7 @@ that batch to run the model forward pass. The remaining examples are discarded.
 This reduces compute while preserving an unbiased estimate over the sampled
 subset.
 """
-import argparse, json, math, io
+import argparse, json, math, io, random
 from pathlib import Path
 
 import numpy as np
@@ -157,6 +157,12 @@ def evaluate(model: torch.nn.Module,
 def main(args):
     # ----- model ---------------------------------------------------------- #
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # ----- seeding -------------------------------------------------------- #
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     model  = load_openlm_model_from_uuid(args.uuid)
     model.to(device, dtype=torch.bfloat16).eval()
 
@@ -190,8 +196,10 @@ if __name__ == "__main__":
                         help="Directory containing tokenised OpenHermes shards (*.tar)")
     parser.add_argument("--uuid", required=True,
                         help="Datacomp-LM / Open-LM run UUID identifying the checkpoint to evaluate")
+    parser.add_argument("--seed", type=int, default=43,
+                        help="Random seed for reproducible subsampling (default: 43)")
     parser.add_argument("--batch-size", type=int, default=16,
                         help="Number of examples to subsample per full batch for the forward pass (default: 16)")
-    parser.add_argument("--full-batch-size", type=int, default=256,
+    parser.add_argument("--full-batch-size", type=int, default=128,
                         help="Full batch size to load/collate before subsampling (default: 64)")
     main(parser.parse_args())

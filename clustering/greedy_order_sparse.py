@@ -148,7 +148,7 @@ def build_sparse_rep(counts_all: torch.Tensor):
 
 
 def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, norms2: torch.Tensor,
-                      target: np.ndarray, k_return: int = 1, error_log_path: str = "") -> list[int]:
+                      target: np.ndarray, k_return: int = 1, error_log_path: str = "", chunk_size: int = 512) -> list[int]:
     """Greedy ordering using CPU sparse matrix math (single big matrix)."""
 
     target_t = torch.as_tensor(target, dtype=torch.float32)
@@ -160,6 +160,9 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
     cum_counts = torch.zeros(n_cluster, dtype=torch.float32)
     used_mask = torch.zeros(n_total, dtype=torch.bool)
     order: list[int] = []
+
+    # Chunk-wise logging (every chunk_size sequences)
+    chunk_counts = torch.zeros(n_cluster, dtype=torch.float32)
 
     pbar = tqdm(total=n_total, desc="Ordering sequences (CPU-sparse)")
 
@@ -191,17 +194,40 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
         # Update state
         used_mask[chosen] = True
         cum_counts += counts_all[chosen]
+        chunk_counts += counts_all[chosen]
         order.append(chosen)
 
         # --- error logging ---
         if log_fh is not None:
             total_tokens = len(order) * seq_len_const
-            current_ratio = cum_counts / total_tokens
-            l2_err = torch.norm(current_ratio - target_t, p=2).item()
+            # 1D scalar distance from expected cumulative counts at this step
+            expected_cum = target_t * total_tokens
+            cum_residual = expected_cum - cum_counts
+            cum_l2 = torch.norm(cum_residual, p=2).item()
             import json as _json
-            log_fh.write(_json.dumps({"step": len(order), "l2": l2_err}) + "\n")
+            log_fh.write(_json.dumps({
+                "step": len(order),
+                "tokens": int(total_tokens),
+                "cum_l2": cum_l2
+            }) + "\n")
 
         pbar.update(1)
+
+        # --- chunk logging every 512 sequences ---
+        if log_fh is not None and (len(order) % chunk_size == 0):
+            expected_chunk_tokens = chunk_size * seq_len_const
+            expected_chunk_counts = target_t * expected_chunk_tokens
+            chunk_residual = chunk_counts - expected_chunk_counts
+            chunk_l2 = torch.norm(chunk_residual, p=2).item()
+            import json as _json
+            log_fh.write(_json.dumps({
+                "step": len(order),
+                "chunk_size": int(chunk_size),
+                "chunk_tokens": int(expected_chunk_tokens),
+                "chunk_l2": chunk_l2
+            }) + "\n")
+            # reset for next chunk
+            chunk_counts.zero_()
 
     pbar.close()
     if log_fh is not None:
@@ -293,6 +319,8 @@ def main():
                     help='Worker processes for WebLoader streaming')
     ap.add_argument('--loader-prefetch', type=int, default=8,
                     help='Prefetch batches per worker (WebLoader)')
+    ap.add_argument('--chunk-size', type=int, default=512,
+                    help='Chunk size for per-chunk L2 logging (sequences)')
     # No separate error-log flag; it will be written to <out-dir>/error_log.jsonl automatically
     args = ap.parse_args()
 
@@ -324,7 +352,7 @@ def main():
 
     error_log_path = str(out_dir / "error_log.jsonl")
 
-    order_indices = greedy_cpu_sparse(counts_all, counts_sparse, norms2, target, k_return=1, error_log_path=error_log_path)
+    order_indices = greedy_cpu_sparse(counts_all, counts_sparse, norms2, target, k_return=1, error_log_path=error_log_path, chunk_size=args.chunk_size)
 
     # ------------------------------------------------------------------ write output
     manifest = write_output(order_indices, tokens_all, counts_all, tokens_dir, counts_dir, args.shard_size)
