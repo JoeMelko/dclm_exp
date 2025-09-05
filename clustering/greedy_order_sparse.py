@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-greedy_order_gpu.py
-===================
+greedy_order_sparse.py
+======================
 
-Multi-GPU greedy ordering for ≈10 M sequences × 10 k clusters.
+CPU-sparse greedy ordering for large sequence × cluster problems.
 
 Key ideas
 ---------
@@ -24,21 +24,34 @@ No Faiss / no scipy required.
 
 Usage
 -----
- Run on 8 H100 GPUs:
+ Example run:
  
-     python greedy_order.py \
+     python greedy_order_sparse.py \
          --input-dir   /path/to/tokenized_shards \
          --ratio-file  cluster_ratios.json \
          --out-dir     /path/to/ordered_tokens \  # tokens shards + manifest
          --shard-size 8192 \
-         --gpus 8
+         --gpus 8 \
+         --reg-type l2sum_schedule \
+         --reg-lambda 0.1
  
 This writes token shards into ``--out-dir`` and matching counts-only
 shards into ``--out-dir/counts``.
+ 
+Regularization
+--------------
+- ``--reg-type``: ``none`` (default) or ``l2sum_schedule``.
+  - ``l2sum_schedule`` adds a penalty equal to the squared deviation between
+    the cumulative sum of per-sequence L2 norms (including the candidate) and
+    the expected schedule (step/N * total_L2_sum).
+- ``--reg-lambda`` scales the regularization term (0.0 disables).
+ - ``histogram_schedule``: build buckets over L2 norms (``--n-buckets``; ``--bucket-method``
+   quantile|uniform, default quantile) and penalize squared L2 discrepancy between expected
+   and actual bucket counts at each step.
 """
 
 from __future__ import annotations
-import argparse, json, gzip, tarfile, uuid, os
+import argparse, json, gzip, tarfile, uuid
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -115,18 +128,16 @@ def stream_shards_to_arrays(
     )
 
     tokens_all: list[bytes] = []
-    meta_all  : list[SequenceMeta] = []
 
-    for key, tok_bytes in tqdm(loader, desc="Streaming tokens", unit="seq"):
+    for _key, tok_bytes in tqdm(loader, desc="Streaming tokens", unit="seq"):
         tokens_all.append(tok_bytes)
-        meta_all.append(SequenceMeta(key.split("@")[0], key))
 
     if len(tokens_all) != counts_all.shape[0]:
         raise RuntimeError(
             f"Mismatch between token sequences ({len(tokens_all)}) and counts ({counts_all.shape[0]})"
         )
 
-    return counts_all, tokens_all, meta_all
+    return counts_all, tokens_all, []
 
 
 # --------------------------------------------------------------------------- #
@@ -147,8 +158,34 @@ def build_sparse_rep(counts_all: torch.Tensor):
 # --------------------------------------------------------------------------- #
 
 
+def make_regularizer(reg_type: str):
+    """Return a vectorized regularization function.
+
+    The returned function signature is:
+        reg_fn(cum_so_far: float, candidate_norms: torch.Tensor, expected_next: float) -> torch.Tensor
+
+    It returns a tensor of per-candidate penalties (without lambda applied).
+    """
+    if reg_type == "none":
+        def _none(_cum_so_far: float, candidate_norms: torch.Tensor, _expected_next: float) -> torch.Tensor:
+            return torch.zeros_like(candidate_norms)
+        return _none
+
+    if reg_type == "l2sum_schedule":
+        # Penalty = ( (cum_so_far + l2norm(candidate)) - expected_next )^2
+        def _l2sum(cum_so_far: float, candidate_norms: torch.Tensor, expected_next: float) -> torch.Tensor:
+            return (candidate_norms + cum_so_far - expected_next).pow(2)
+        return _l2sum
+
+    raise ValueError(f"Unknown regularizer type: {reg_type}")
+
+
 def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, norms2: torch.Tensor,
-                      target: np.ndarray, k_return: int = 1, error_log_path: str = "", chunk_size: int = 512) -> list[int]:
+                      target: np.ndarray, k_return: int = 1, error_log_path: str = "", chunk_size: int = 512,
+                      reg_type: str = "none", reg_lambda: float = 0.0,
+                      l2norms: torch.Tensor | None = None, total_l2_sum: float | None = None,
+                      bucket_ids: torch.Tensor | None = None, total_bucket_counts: torch.Tensor | None = None,
+                      n_buckets: int | None = None) -> list[int]:
     """Greedy ordering using CPU sparse matrix math (single big matrix)."""
 
     target_t = torch.as_tensor(target, dtype=torch.float32)
@@ -168,6 +205,29 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
 
     log_fh = open(error_log_path, "w") if error_log_path else None
 
+    # --- regularization setup ---
+    reg_fn = make_regularizer(reg_type) if reg_type == "l2sum_schedule" else None
+    use_reg = (reg_type != "none") and (reg_lambda != 0.0)
+    if use_reg:
+        if reg_type == "l2sum_schedule":
+            if l2norms is None or total_l2_sum is None:
+                # Fallback compute if not provided
+                l2norms = torch.sqrt(norms2)
+                total_l2_sum = float(l2norms.sum().item())
+            # Ensure types
+            l2norms = l2norms.to(dtype=torch.float32)
+            cum_l2sum: float = 0.0
+        elif reg_type == "histogram_schedule":
+            if bucket_ids is None or total_bucket_counts is None or n_buckets is None:
+                raise ValueError("Histogram regularizer requires bucket_ids, total_bucket_counts and n_buckets")
+            bucket_ids = bucket_ids.to(dtype=torch.long)
+            total_bucket_counts = total_bucket_counts.to(dtype=torch.float32)
+            actual_bucket_counts = torch.zeros(n_buckets, dtype=torch.float32)
+        else:
+            pass
+    else:
+        cum_l2sum = 0.0  # maintained for logging consistency if ever needed
+
     while len(order) < n_total:
         tokens_after_step = (len(order) + 1) * seq_len_const
         desired_next_total = target_t * tokens_after_step
@@ -178,10 +238,35 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
         dots = torch.sparse.mm(counts_sparse, residual_for_choice.unsqueeze(1)).squeeze(1)
 
         errs = norms2 + d_norm2 - 2 * dots
-        errs[used_mask] = float("inf")
+
+        # --- regularization term (vector) ---
+        if use_reg:
+            if reg_type == "l2sum_schedule":
+                expected_next_norm = (len(order) + 1) / n_total * float(total_l2_sum)  # type: ignore[arg-type]
+                reg_vec = reg_fn(cum_l2sum, l2norms, expected_next_norm)  # type: ignore[operator]
+                errs_total = errs + (reg_lambda * reg_vec)
+            elif reg_type == "histogram_schedule":
+                # expected counts for next step
+                expected_next_counts = total_bucket_counts * ((len(order) + 1) / n_total)
+                delta = actual_bucket_counts - expected_next_counts  # (B,)
+                base_const = float((delta * delta).sum().item())
+                # Precompute per-bucket penalties: ||delta + e_b||^2 = ||delta||^2 + 2*delta[b] + 1
+                bucket_penalty = (2.0 * delta) + (1.0 + base_const)  # (B,)
+                # Map each candidate to its bucket penalty
+                reg_vec = bucket_penalty[bucket_ids]
+                errs_total = errs + (reg_lambda * reg_vec)
+            else:
+                reg_vec = torch.zeros_like(errs)
+                errs_total = errs
+        else:
+            # zero reg
+            reg_vec = torch.zeros_like(errs)
+            errs_total = errs
+
+        errs_total[used_mask] = float("inf")
 
         # k_return allows quick fallback; default 1 for simplicity
-        topk_val, topk_idx = torch.topk(errs, k_return, largest=False)
+        topk_val, topk_idx = torch.topk(errs_total, k_return, largest=False)
         chosen = None
         for idx in topk_idx:
             if not used_mask[idx]:
@@ -189,13 +274,19 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
                 break
         if chosen is None:
             # exhaustive argmin
-            chosen = int(torch.argmin(errs).item())
+            chosen = int(torch.argmin(errs_total).item())
 
         # Update state
         used_mask[chosen] = True
         cum_counts += counts_all[chosen]
         chunk_counts += counts_all[chosen]
         order.append(chosen)
+        if use_reg:
+            if reg_type == "l2sum_schedule":
+                cum_l2sum += float(l2norms[chosen].item())
+            elif reg_type == "histogram_schedule":
+                b = int(bucket_ids[chosen].item())
+                actual_bucket_counts[b] += 1.0
 
         # --- error logging ---
         if log_fh is not None:
@@ -204,11 +295,15 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
             expected_cum = target_t * total_tokens
             cum_residual = expected_cum - cum_counts
             cum_l2 = torch.norm(cum_residual, p=2).item()
+            base_error = float(errs[chosen].item())
+            reg_error = float(reg_vec[chosen].item()) if use_reg else 0.0
             import json as _json
             log_fh.write(_json.dumps({
                 "step": len(order),
                 "tokens": int(total_tokens),
-                "cum_l2": cum_l2
+                "cum_l2": cum_l2,
+                "base_error": base_error,
+                "reg_error": reg_error
             }) + "\n")
 
         pbar.update(1)
@@ -321,6 +416,14 @@ def main():
                     help='Prefetch batches per worker (WebLoader)')
     ap.add_argument('--chunk-size', type=int, default=512,
                     help='Chunk size for per-chunk L2 logging (sequences)')
+    ap.add_argument('--reg-type', type=str, default='none', choices=['none', 'l2sum_schedule', 'histogram_schedule'],
+                    help='Regularization strategy to apply during selection')
+    ap.add_argument('--reg-lambda', type=float, default=0.0,
+                    help='Weight applied to the regularization term (0.0 disables)')
+    ap.add_argument('--n-buckets', type=int, default=10,
+                    help='Number of buckets for histogram_schedule regularizer')
+    ap.add_argument('--bucket-method', type=str, default='quantile', choices=['uniform', 'quantile'],
+                    help='Bucketization method for histogram_schedule regularizer')
     # No separate error-log flag; it will be written to <out-dir>/error_log.jsonl automatically
     args = ap.parse_args()
 
@@ -332,7 +435,7 @@ def main():
     shard_paths = sorted(Path(args.input_dir).glob('shard_*.tar'))
     print(f"Found {len(shard_paths)} shards; loading counts tensors and streaming token data …")
 
-    counts_all, tokens_all, meta_all = stream_shards_to_arrays(
+    counts_all, tokens_all, _ = stream_shards_to_arrays(
         shard_paths,
         n_cluster=n_cluster,
         workers=args.loader_workers,
@@ -341,6 +444,35 @@ def main():
 
     # ------------------------------------------------------------------ build sparse representation & greedy order (CPU)
     counts_sparse, norms2 = build_sparse_rep(counts_all)
+    # Precompute per-sequence L2 norms and their total sum for regularization
+    l2norms = torch.sqrt(norms2)
+    total_l2_sum = float(l2norms.sum().item())
+
+    # Histogram regularizer precomputation if requested
+    bucket_ids = None
+    total_bucket_counts = None
+    if args.reg_type == 'histogram_schedule':
+        n_b = int(args.n_buckets)
+        if args.bucket_method == 'quantile':
+            quantiles = torch.linspace(0, 1, steps=n_b + 1)
+            # Use numpy for quantile boundaries for numerical stability
+            boundaries = torch.as_tensor(np.quantile(l2norms.numpy(), quantiles.numpy()), dtype=torch.float32)
+            # Ensure strictly increasing boundaries to avoid edge issues
+            boundaries[0] = float('-inf'); boundaries[-1] = float('inf')
+            # torch.bucketize returns bin index such that boundaries[i-1] < x <= boundaries[i] for right=True
+            bucket_ids = torch.bucketize(l2norms, boundaries[1:-1], right=True)
+        else:
+            lmin = float(l2norms.min().item()); lmax = float(l2norms.max().item())
+            if lmax == lmin:
+                bucket_ids = torch.zeros_like(l2norms, dtype=torch.long)
+            else:
+                # Map to [0, n_b-1]
+                scaled = (l2norms - lmin) / max(1e-12, (lmax - lmin))
+                bucket_ids = torch.clamp((scaled * n_b).floor().to(torch.long), 0, n_b - 1)
+        n_buckets = n_b
+        total_bucket_counts = torch.bincount(bucket_ids, minlength=n_buckets).to(dtype=torch.float32)
+    else:
+        n_buckets = None
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -352,7 +484,22 @@ def main():
 
     error_log_path = str(out_dir / "error_log.jsonl")
 
-    order_indices = greedy_cpu_sparse(counts_all, counts_sparse, norms2, target, k_return=1, error_log_path=error_log_path, chunk_size=args.chunk_size)
+    order_indices = greedy_cpu_sparse(
+        counts_all,
+        counts_sparse,
+        norms2,
+        target,
+        k_return=1,
+        error_log_path=error_log_path,
+        chunk_size=args.chunk_size,
+        reg_type=args.reg_type,
+        reg_lambda=args.reg_lambda,
+        l2norms=l2norms,
+        total_l2_sum=total_l2_sum,
+        bucket_ids=bucket_ids,
+        total_bucket_counts=total_bucket_counts,
+        n_buckets=n_buckets,
+    )
 
     # ------------------------------------------------------------------ write output
     manifest = write_output(order_indices, tokens_all, counts_all, tokens_dir, counts_dir, args.shard_size)
