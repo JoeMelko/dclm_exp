@@ -176,6 +176,7 @@ def main():
         pin_memory=True,
         collate_fn=lambda b: collate(b, tokenizer, args.max_len),
         persistent_workers=args.workers > 0,
+        prefetch_factor=2,
     )
 
     # --------------------- embed & dump ------------------------------------ #
