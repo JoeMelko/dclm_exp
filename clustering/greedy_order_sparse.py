@@ -112,6 +112,7 @@ def stream_shards_to_arrays(
         counts_tensor_list.append(tens.to(dtype=torch.float32, copy=False))
 
     counts_all: torch.Tensor = torch.cat(counts_tensor_list, dim=0)
+    
 
     # ------------------------------------------------------------------ stream tokens (only) with WebDataset
     dataset = (
@@ -173,8 +174,8 @@ def make_regularizer(reg_type: str):
 
     if reg_type == "l2sum_schedule":
         # Penalty = ( (cum_so_far + l2norm(candidate)) - expected_next )^2
-        def _l2sum(cum_so_far: float, candidate_norms: torch.Tensor, expected_next: float) -> torch.Tensor:
-            return (candidate_norms + cum_so_far - expected_next).pow(2)
+        def _l2sum(cum_so_far: float, candidate_norms: torch.Tensor, expected_next: float, seq_len_const: int) -> torch.Tensor:
+            return ((candidate_norms + cum_so_far - expected_next)/(seq_len_const * seq_len_const)).pow(2)
         return _l2sum
 
     raise ValueError(f"Unknown regularizer type: {reg_type}")
@@ -238,12 +239,15 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
         dots = torch.sparse.mm(counts_sparse, residual_for_choice.unsqueeze(1)).squeeze(1)
 
         errs = norms2 + d_norm2 - 2 * dots
+        
+        # account for sequence length
+        errs /= (seq_len_const * seq_len_const)
 
         # --- regularization term (vector) ---
         if use_reg:
             if reg_type == "l2sum_schedule":
                 expected_next_norm = (len(order) + 1) / n_total * float(total_l2_sum)  # type: ignore[arg-type]
-                reg_vec = reg_fn(cum_l2sum, l2norms, expected_next_norm)  # type: ignore[operator]
+                reg_vec = reg_fn(cum_l2sum, l2norms, expected_next_norm, seq_len_const)  # type: ignore[operator]
                 errs_total = errs + (reg_lambda * reg_vec)
             elif reg_type == "histogram_schedule":
                 # expected counts for next step
@@ -292,17 +296,12 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
         if log_fh is not None:
             total_tokens = len(order) * seq_len_const
             # 1D scalar distance from expected cumulative counts at this step
-            expected_cum = target_t * total_tokens
-            cum_residual = expected_cum - cum_counts
-            cum_l2 = torch.norm(cum_residual, p=2).item()
-            base_error = float(errs[chosen].item())
             reg_error = float(reg_vec[chosen].item()) if use_reg else 0.0
             import json as _json
             log_fh.write(_json.dumps({
                 "step": len(order),
                 "tokens": int(total_tokens),
-                "cum_l2": cum_l2,
-                "base_error": base_error,
+                "cum_l2": float(errs[chosen].sqrt().item()),
                 "reg_error": reg_error
             }) + "\n")
 
