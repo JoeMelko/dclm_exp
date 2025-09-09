@@ -72,6 +72,98 @@ class SequenceMeta:
     uuid_str   : str   # uuid inside that tar
 
 
+def _w2_total_cost_squared(source_counts: torch.Tensor, target_counts: torch.Tensor) -> float:
+    """Compute W2^2 between two 1D histograms on equal-width bins with quadratic cost.
+
+    Parameters
+    ----------
+    source_counts : torch.Tensor (B,) float32
+        Actual counts per bin. Sum must equal sum of target_counts.
+    target_counts : torch.Tensor (B,) float32
+        Target counts per bin. Same total mass as source_counts.
+
+    Returns
+    -------
+    float
+        The squared Wasserstein-2 distance (with positions at integer bin indices).
+    """
+    B = int(source_counts.shape[0])
+    i = 0
+    j = 0
+    rem_i = float(source_counts[0].item()) if B > 0 else 0.0
+    rem_j = float(target_counts[0].item()) if B > 0 else 0.0
+    cost = 0.0
+    while i < B and j < B:
+        if rem_i == 0.0:
+            i += 1
+            if i >= B:
+                break
+            rem_i = float(source_counts[i].item())
+            continue
+        if rem_j == 0.0:
+            j += 1
+            if j >= B:
+                break
+            rem_j = float(target_counts[j].item())
+            continue
+        flow = rem_i if rem_i <= rem_j else rem_j
+        cost += flow * float((i - j) * (i - j))
+        rem_i -= flow
+        rem_j -= flow
+    return cost
+
+
+def _w2_incremental_unit_costs_squared(actual_counts: torch.Tensor, expected_next_counts: torch.Tensor) -> torch.Tensor:
+    """Per-bucket incremental W2^2 for adding one unit to each bucket.
+
+    Computes, for each bucket r, the additional squared W2 transport cost incurred by
+    adding a single unit of mass to r, when comparing to `expected_next_counts`.
+
+    This assumes equal-width bins positioned at integer indices, so distances are
+    squared index differences.
+    """
+    B = int(actual_counts.shape[0])
+    if B == 0:
+        return torch.empty(0, dtype=torch.float32)
+
+    # Prefix sums (CDFs)
+    A = torch.cumsum(actual_counts.to(dtype=torch.float32), dim=0).cpu().numpy()
+    Bcdf = torch.cumsum(expected_next_counts.to(dtype=torch.float32), dim=0).cpu().numpy()
+    Bcdf_prev = np.empty_like(Bcdf)
+    Bcdf_prev[0] = 0.0
+    if B > 1:
+        Bcdf_prev[1:] = Bcdf[:-1]
+
+    costs = np.zeros(B, dtype=np.float32)
+    for r in range(B):
+        a = float(A[r])
+        remaining = 1.0
+        # Locate first target bin whose cumulative exceeds a
+        j = int(np.searchsorted(Bcdf, a, side='right'))
+        # If a is exactly at the end (should not happen as Bcdf[-1] = step >= a+1), clamp j
+        if j >= B:
+            j = B - 1
+        # Walk across target bins to allocate the unit interval
+        while remaining > 0.0 and j < B:
+            left = a
+            right = a + remaining
+            seg_start = max(left, float(Bcdf_prev[j]))
+            seg_end = min(right, float(Bcdf[j]))
+            L = seg_end - seg_start
+            if L > 0.0:
+                costs[r] += float(L) * float((r - j) * (r - j))
+                a += L
+                remaining -= L
+                if a >= float(Bcdf[j]) - 1e-12:
+                    j += 1
+            else:
+                # Advance to next target bin if no overlap
+                if right <= float(Bcdf_prev[j]) + 1e-12:
+                    break
+                j += 1
+    return torch.from_numpy(costs)
+
+
 def read_ratio_file(path: Path) -> np.ndarray:
     data = json.loads(Path(path).read_text())
     ratios = np.asarray(data['ratios'] if isinstance(data, dict) else data, dtype=np.float32)
@@ -186,7 +278,7 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
                       reg_type: str = "none", reg_lambda: float = 0.0,
                       l2norms: torch.Tensor | None = None, total_l2_sum: float | None = None,
                       bucket_ids: torch.Tensor | None = None, total_bucket_counts: torch.Tensor | None = None,
-                      n_buckets: int | None = None) -> list[int]:
+                      n_buckets: int | None = None, random_select: bool = False) -> list[int]:
     """Greedy ordering using CPU sparse matrix math (single big matrix)."""
 
     target_t = torch.as_tensor(target, dtype=torch.float32)
@@ -221,6 +313,12 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
         elif reg_type == "histogram_schedule":
             if bucket_ids is None or total_bucket_counts is None or n_buckets is None:
                 raise ValueError("Histogram regularizer requires bucket_ids, total_bucket_counts and n_buckets")
+            bucket_ids = bucket_ids.to(dtype=torch.long)
+            total_bucket_counts = total_bucket_counts.to(dtype=torch.float32)
+            actual_bucket_counts = torch.zeros(n_buckets, dtype=torch.float32)
+        elif reg_type == "w2_histogram_schedule":
+            if bucket_ids is None or total_bucket_counts is None or n_buckets is None:
+                raise ValueError("W2 histogram regularizer requires bucket_ids, total_bucket_counts and n_buckets")
             bucket_ids = bucket_ids.to(dtype=torch.long)
             total_bucket_counts = total_bucket_counts.to(dtype=torch.float32)
             actual_bucket_counts = torch.zeros(n_buckets, dtype=torch.float32)
@@ -259,6 +357,14 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
                 # Map each candidate to its bucket penalty
                 reg_vec = bucket_penalty[bucket_ids]
                 errs_total = errs + (reg_lambda * reg_vec)
+            elif reg_type == "w2_histogram_schedule":
+                # expected counts for next step
+                expected_next_counts = total_bucket_counts * ((len(order) + 1) / n_total)
+                # Compute per-bucket incremental W2^2 costs for adding one unit to each bucket
+                bucket_w2_costs = _w2_incremental_unit_costs_squared(actual_counts=actual_bucket_counts,
+                                                                      expected_next_counts=expected_next_counts)
+                reg_vec = bucket_w2_costs[bucket_ids]
+                errs_total = errs + (reg_lambda * reg_vec)
             else:
                 reg_vec = torch.zeros_like(errs)
                 errs_total = errs
@@ -269,16 +375,21 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
 
         errs_total[used_mask] = float("inf")
 
-        # k_return allows quick fallback; default 1 for simplicity
-        topk_val, topk_idx = torch.topk(errs_total, k_return, largest=False)
-        chosen = None
-        for idx in topk_idx:
-            if not used_mask[idx]:
-                chosen = int(idx.item())
-                break
-        if chosen is None:
-            # exhaustive argmin
-            chosen = int(torch.argmin(errs_total).item())
+        if random_select:
+            available = (~used_mask).nonzero(as_tuple=False).squeeze(1)
+            ridx = torch.randint(0, available.numel(), (1,)).item()
+            chosen = int(available[ridx].item())
+        else:
+            # k_return allows quick fallback; default 1 for simplicity
+            topk_val, topk_idx = torch.topk(errs_total, k_return, largest=False)
+            chosen = None
+            for idx in topk_idx:
+                if not used_mask[idx]:
+                    chosen = int(idx.item())
+                    break
+            if chosen is None:
+                # exhaustive argmin
+                chosen = int(torch.argmin(errs_total).item())
 
         # Update state
         used_mask[chosen] = True
@@ -289,6 +400,9 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
             if reg_type == "l2sum_schedule":
                 cum_l2sum += float(l2norms[chosen].item())
             elif reg_type == "histogram_schedule":
+                b = int(bucket_ids[chosen].item())
+                actual_bucket_counts[b] += 1.0
+            elif reg_type == "w2_histogram_schedule":
                 b = int(bucket_ids[chosen].item())
                 actual_bucket_counts[b] += 1.0
 
@@ -302,7 +416,8 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
                 "step": len(order),
                 "tokens": int(total_tokens),
                 "cum_l2": float(errs[chosen].sqrt().item()),
-                "reg_error": reg_error
+                "reg_error": reg_error,
+                "err_total": float(errs_total[chosen].item())
             }) + "\n")
 
         pbar.update(1)
@@ -313,12 +428,37 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
             expected_chunk_counts = target_t * expected_chunk_tokens
             chunk_residual = chunk_counts - expected_chunk_counts
             chunk_l2 = torch.norm(chunk_residual, p=2).item()
+            # Compute chunk-level regularization error using only this chunk's members
+            chunk_reg_error = 0.0
+            if use_reg:
+                if reg_type == "l2sum_schedule":
+                    # Compare sum of L2 norms in this chunk to expected chunk contribution
+                    chunk_indices = order[-chunk_size:]
+                    chunk_l2sum = float(l2norms[chunk_indices].sum().item())
+                    expected_chunk_norm = (chunk_size / n_total) * float(total_l2_sum)
+                    chunk_reg_error = ((chunk_l2sum - expected_chunk_norm) / (seq_len_const * seq_len_const)) ** 2
+                elif reg_type == "histogram_schedule":
+                    # Compare per-bucket counts in this chunk to expected per-bucket chunk counts
+                    chunk_indices = order[-chunk_size:]
+                    b_ids = bucket_ids[chunk_indices]
+                    actual_chunk_bucket_counts = torch.bincount(b_ids, minlength=n_buckets).to(dtype=torch.float32)
+                    expected_chunk_bucket_counts = total_bucket_counts * (chunk_size / n_total)
+                    delta_chunk = actual_chunk_bucket_counts - expected_chunk_bucket_counts
+                    chunk_reg_error = float((delta_chunk * delta_chunk).sum().item())
+                elif reg_type == "w2_histogram_schedule":
+                    # W2^2 between per-bucket counts in this chunk and expected per-bucket chunk counts
+                    chunk_indices = order[-chunk_size:]
+                    b_ids = bucket_ids[chunk_indices]
+                    actual_chunk_bucket_counts = torch.bincount(b_ids, minlength=n_buckets).to(dtype=torch.float32)
+                    expected_chunk_bucket_counts = total_bucket_counts * (chunk_size / n_total)
+                    chunk_reg_error = _w2_total_cost_squared(actual_chunk_bucket_counts, expected_chunk_bucket_counts)
             import json as _json
             log_fh.write(_json.dumps({
                 "step": len(order),
                 "chunk_size": int(chunk_size),
                 "chunk_tokens": int(expected_chunk_tokens),
-                "chunk_l2": chunk_l2
+                "chunk_l2": chunk_l2,
+                "chunk_reg_error": float(chunk_reg_error)
             }) + "\n")
             # reset for next chunk
             chunk_counts.zero_()
@@ -402,7 +542,7 @@ def write_manifest(manifest: list[Dict], out_dir: Path,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--input-dir', required=True)
-    ap.add_argument('--ratio-file', required=True)
+    ap.add_argument('--ratio-file', required=False, help='Optional cluster ratio file; if omitted, ratios are inferred from data')
     ap.add_argument('--out-dir', required=True,
                     help="Output directory. Will contain token shards + manifest.jsonl, a 'counts' subdir for counts shards, and error_log.jsonl")
     ap.add_argument('--shard-size', type=int, default=64,
@@ -415,7 +555,7 @@ def main():
                     help='Prefetch batches per worker (WebLoader)')
     ap.add_argument('--chunk-size', type=int, default=512,
                     help='Chunk size for per-chunk L2 logging (sequences)')
-    ap.add_argument('--reg-type', type=str, default='none', choices=['none', 'l2sum_schedule', 'histogram_schedule'],
+    ap.add_argument('--reg-type', type=str, default='none', choices=['none', 'l2sum_schedule', 'histogram_schedule', 'w2_histogram_schedule'],
                     help='Regularization strategy to apply during selection')
     ap.add_argument('--reg-lambda', type=float, default=0.0,
                     help='Weight applied to the regularization term (0.0 disables)')
@@ -423,15 +563,25 @@ def main():
                     help='Number of buckets for histogram_schedule regularizer')
     ap.add_argument('--bucket-method', type=str, default='quantile', choices=['uniform', 'quantile'],
                     help='Bucketization method for histogram_schedule regularizer')
+    ap.add_argument('--rand', action='store_true', help='Choose sequences uniformly at random instead of greedy error minimization')
     # No separate error-log flag; it will be written to <out-dir>/error_log.jsonl automatically
     args = ap.parse_args()
 
-    target = read_ratio_file(Path(args.ratio_file))
-    n_cluster = len(target)
-    print(f'Clusters: {n_cluster}')
-
     # ------------------------------------------------------------------ load tars
     shard_paths = sorted(Path(args.input_dir).glob('shard_*.tar'))
+    if len(shard_paths) == 0:
+        raise FileNotFoundError(f"No shards found in {args.input_dir}")
+
+    # Determine number of clusters (n_cluster) from the first counts tensor
+    first_counts_path = shard_paths[0].parent / f"{shard_paths[0].stem}_counts.pt"
+    if not first_counts_path.exists():
+        raise FileNotFoundError(f"Expected counts file {first_counts_path} for shard {shard_paths[0]}")
+    _first_counts: torch.Tensor = torch.load(first_counts_path, map_location="cpu")  # type: ignore
+    if _first_counts.ndim != 2:
+        raise ValueError(f"Counts tensor in {first_counts_path} must be 2D")
+    n_cluster = int(_first_counts.shape[1])
+    print(f'Clusters: {n_cluster}')
+
     print(f"Found {len(shard_paths)} shards; loading counts tensors and streaming token data …")
 
     counts_all, tokens_all, _ = stream_shards_to_arrays(
@@ -440,6 +590,18 @@ def main():
         workers=args.loader_workers,
         prefetch=args.loader_prefetch,
     )
+
+    # If ratio file is provided, read it and validate; else infer from data
+    if args.ratio_file:
+        target = read_ratio_file(Path(args.ratio_file))
+        if len(target) != n_cluster:
+            raise ValueError(f"Ratio file has {len(target)} clusters but data has {n_cluster}")
+    else:
+        totals = counts_all.sum(dim=0).to(dtype=torch.float64)
+        total_sum = float(totals.sum().item())
+        if total_sum == 0.0:
+            raise ValueError("Total token count across all clusters is zero; cannot infer ratios")
+        target = (totals.cpu().numpy() / total_sum).astype(np.float32)
 
     # ------------------------------------------------------------------ build sparse representation & greedy order (CPU)
     counts_sparse, norms2 = build_sparse_rep(counts_all)
@@ -450,7 +612,7 @@ def main():
     # Histogram regularizer precomputation if requested
     bucket_ids = None
     total_bucket_counts = None
-    if args.reg_type == 'histogram_schedule':
+    if args.reg_type in ('histogram_schedule', 'w2_histogram_schedule'):
         n_b = int(args.n_buckets)
         if args.bucket_method == 'quantile':
             quantiles = torch.linspace(0, 1, steps=n_b + 1)
@@ -498,6 +660,7 @@ def main():
         bucket_ids=bucket_ids,
         total_bucket_counts=total_bucket_counts,
         n_buckets=n_buckets,
+        random_select=bool(getattr(args, 'rand', False)),
     )
 
     # ------------------------------------------------------------------ write output
