@@ -178,6 +178,8 @@ def load_dataset_lines(ds_dir: Path) -> List[str]:
     """Load *all* lines from ``combined.jsonl.zstd`` inside *ds_dir*."""
     src = ds_dir / "combined.jsonl.zstd"
     if not src.exists():
+        src = ds_dir / "shard_00000000_processed.jsonl.zstd"
+    if not src.exists():
         raise FileNotFoundError(f"Source file not found: {src}")
     return list(_open_zstd_text(src))
 
@@ -312,7 +314,7 @@ def main(argv: list[str] | None = None):
     sample_ids: List[int] = []
     sample_lines: List[str] = []
 
-    for idx in range(10000):
+    for idx in range(1000):
         key = f"dataset{idx}"
         ratio = ratio_map.get(key)
         if ratio is None:
