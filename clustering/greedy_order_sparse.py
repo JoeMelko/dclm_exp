@@ -291,6 +291,7 @@ def make_regularizer(reg_type: str):
 
 def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, norms2: torch.Tensor,
                       target: np.ndarray, k_return: int = 1, error_log_path: str = "", chunk_size: int = 512,
+                      debug_log_path: str = "",
                       reg_type: str = "none", reg_lambda: float = 0.0,
                       l2norms: torch.Tensor | None = None, total_l2_sum: float | None = None,
                       bucket_ids: torch.Tensor | None = None, total_bucket_counts: torch.Tensor | None = None,
@@ -317,6 +318,8 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
     pbar = tqdm(total=n_total, desc="Ordering sequences (CPU-sparse)")
 
     log_fh = open(error_log_path, "w") if error_log_path else None
+    debug_fh = open(debug_log_path, "w") if debug_log_path else None
+    _debug_every = 10000
 
     # --- regularization setup ---
     reg_fn = make_regularizer(reg_type) if reg_type == "l2sum_schedule" else None
@@ -348,13 +351,18 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
             doc_hist_per_seq = doc_hist_per_seq.to(dtype=torch.float32)
             doc_total_tokens_per_bin = doc_total_tokens_per_bin.to(dtype=torch.float32)
             doc_row_norm2 = doc_row_norm2.to(dtype=torch.float32)
-            cum_doc_tokens_per_bin = torch.zeros(doc_n_bins, dtype=torch.float32)
+            cum_doc_tokens_per_bin = torch.zeros(doc_n_bins, dtype=torch.int32)
         else:
             pass
     else:
         cum_l2sum = 0.0  # maintained for logging consistency if ever needed
 
     while len(order) < n_total:
+        if(len(order) % 10000 == 0):
+            if(cum_doc_tokens_per_bin[-1] % 2049 != 0):
+                breakpoint()
+            else:
+                print("sum(cum_doc_tokens_per_bin) % 2049 == 0")
         tokens_after_step = (len(order) + 1) * seq_len_const
         desired_next_total = target_t * tokens_after_step
         residual_for_choice = desired_next_total - cum_counts
@@ -396,7 +404,7 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
             elif reg_type == "docsize_token_schedule":
                 # Expected token mass per bin after placing next sequence
                 expected_next_tokens_per_bin = doc_total_tokens_per_bin * ((len(order) + 1) / n_total)
-                delta_tokens = cum_doc_tokens_per_bin - expected_next_tokens_per_bin
+                delta_tokens = cum_doc_tokens_per_bin.float() - expected_next_tokens_per_bin
                 base_const = float((delta_tokens * delta_tokens).sum().item())
                 # For every candidate i: sqrt(base + 2*<delta, s_i> + ||s_i||^2)
                 dot_term = torch.matmul(doc_hist_per_seq, delta_tokens)
@@ -445,7 +453,7 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
                 b = int(bucket_ids[chosen].item())
                 actual_bucket_counts[b] += 1.0
             elif reg_type == "docsize_token_schedule":
-                cum_doc_tokens_per_bin += doc_hist_per_seq[chosen]
+                cum_doc_tokens_per_bin += doc_hist_per_seq[chosen].to(dtype=torch.int32)
 
         # --- error logging ---
         if log_fh is not None:
@@ -462,6 +470,39 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
             }) + "\n")
 
         pbar.update(1)
+
+        # --- periodic debug logging every 10,000 sequences ---
+        if debug_fh is not None and len(order) > 0 and (len(order) % _debug_every == 0):
+            total_tokens = len(order) * seq_len_const
+            cluster_actual = cum_counts.tolist()
+            cluster_expected = (target_t * total_tokens).to(dtype=torch.float32).tolist()
+            # Default empty arrays for regularizer logs
+            reg_actual: list[float] | list[int] = []
+            reg_expected: list[float] | list[int] = []
+            if use_reg:
+                if reg_type == "l2sum_schedule":
+                    exp_norm = (len(order) / n_total) * float(total_l2_sum)  # type: ignore[arg-type]
+                    reg_actual = [float(cum_l2sum)]
+                    reg_expected = [float(exp_norm)]
+                elif reg_type == "histogram_schedule" and 'actual_bucket_counts' in locals():
+                    reg_actual = actual_bucket_counts.tolist()
+                    reg_expected = (total_bucket_counts * (len(order) / n_total)).to(dtype=torch.float32).tolist()  # type: ignore[union-attr]
+                elif reg_type == "w2_histogram_schedule" and 'actual_bucket_counts' in locals():
+                    reg_actual = actual_bucket_counts.tolist()
+                    reg_expected = (total_bucket_counts * (len(order) / n_total)).to(dtype=torch.float32).tolist()  # type: ignore[union-attr]
+                elif reg_type == "docsize_token_schedule" and 'cum_doc_tokens_per_bin' in locals():
+                    reg_actual = cum_doc_tokens_per_bin.tolist()
+                    reg_expected = (doc_total_tokens_per_bin * (len(order) / n_total)).to(dtype=torch.float32).tolist()  # type: ignore[operator]
+            import json as _json
+            debug_fh.write(_json.dumps({
+                "step": len(order),
+                "tokens": int(total_tokens),
+                "cluster_actual_counts": cluster_actual,
+                "cluster_expected_counts": cluster_expected,
+                "reg_actual_counts": reg_actual,
+                "reg_expected_counts": reg_expected,
+                "reg_type": reg_type,
+            }) + "\n")
 
         # --- chunk logging every 512 sequences ---
         if log_fh is not None and (len(order) % chunk_size == 0):
@@ -512,6 +553,38 @@ def greedy_cpu_sparse(counts_all: torch.Tensor, counts_sparse: torch.Tensor, nor
             chunk_counts.zero_()
 
     pbar.close()
+    # Final debug log after the last sequence
+    if debug_fh is not None:
+        total_tokens = n_total * seq_len_const
+        cluster_actual = cum_counts.tolist()
+        cluster_expected = (target_t * total_tokens).to(dtype=torch.float32).tolist()
+        reg_actual: list[float] | list[int] = []
+        reg_expected: list[float] | list[int] = []
+        if use_reg:
+            if reg_type == "l2sum_schedule":
+                exp_norm = float(total_l2_sum)  # type: ignore[arg-type]
+                reg_actual = [float(cum_l2sum)]
+                reg_expected = [float(exp_norm)]
+            elif reg_type == "histogram_schedule" and 'actual_bucket_counts' in locals():
+                reg_actual = actual_bucket_counts.tolist()
+                reg_expected = total_bucket_counts.to(dtype=torch.float32).tolist()  # type: ignore[union-attr]
+            elif reg_type == "w2_histogram_schedule" and 'actual_bucket_counts' in locals():
+                reg_actual = actual_bucket_counts.tolist()
+                reg_expected = total_bucket_counts.to(dtype=torch.float32).tolist()  # type: ignore[union-attr]
+            elif reg_type == "docsize_token_schedule" and 'cum_doc_tokens_per_bin' in locals():
+                reg_actual = cum_doc_tokens_per_bin.tolist()
+                reg_expected = doc_total_tokens_per_bin.to(dtype=torch.float32).tolist()  # type: ignore[union-attr]
+        import json as _json
+        debug_fh.write(_json.dumps({
+            "step": n_total,
+            "tokens": int(total_tokens),
+            "cluster_actual_counts": cluster_actual,
+            "cluster_expected_counts": cluster_expected,
+            "reg_actual_counts": reg_actual,
+            "reg_expected_counts": reg_expected,
+            "reg_type": reg_type,
+        }) + "\n")
+        debug_fh.close()
     if log_fh is not None:
         log_fh.close()
     return order
@@ -759,7 +832,8 @@ def main():
     counts_dir = out_dir / "counts"
 
     error_log_path = str(out_dir / "error_log.jsonl")
-
+    debug_log_path = str(out_dir / "debug.json")
+    
     order_indices = greedy_cpu_sparse(
         counts_all,
         counts_sparse,
@@ -768,6 +842,7 @@ def main():
         k_return=1,
         error_log_path=error_log_path,
         chunk_size=args.chunk_size,
+        debug_log_path=debug_log_path,
         reg_type=args.reg_type,
         reg_lambda=args.reg_lambda,
         l2norms=l2norms,
