@@ -183,6 +183,7 @@ Use the updated `mgd_logits.npy` in the next call to **B**.
 
 * Every script referenced lives in `dclm_exp/clustering/`.
 * Adjust `--nproc_per_node`, `--batch-size`, etc. for other hardware.
+* When training with enforced ordering, set `--workers 1` to preserve order.
 * For production-scale runs, move large intermediates to S3/GCS and stream.
 
 
