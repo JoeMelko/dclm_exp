@@ -561,6 +561,8 @@ def main():
     ap.add_argument('--rand', action='store_true', help='Choose sequences uniformly at random instead of greedy error minimization')
     ap.add_argument('--dtype', type=str, default='fp32', choices=['fp32', 'fp16', 'bf16'],
                     help='GPU storage dtype for counts (affects counts_all on device only)')
+    ap.add_argument('--truncate-mod', type=int, default=0,
+                    help='If > 0, discard the final len(order) % value sequences so total is a multiple of this')
     args = ap.parse_args()
 
     # ------------------------------------------------------------------ load tars
@@ -730,6 +732,15 @@ def main():
         doc_n_bins=doc_n_bins,
         doc_row_norm2=doc_row_norm2,
     )
+
+    # Optionally truncate the final ordered list to a multiple of --truncate-mod
+    truncate_mod = int(getattr(args, 'truncate_mod', 0) or 0)
+    if truncate_mod > 0:
+        remainder = len(order_indices) % truncate_mod
+        if remainder != 0:
+            orig_len = len(order_indices)
+            order_indices = order_indices[:-remainder]
+            print(f"Truncated ordered sequences from {orig_len} to {len(order_indices)} (multiple of {truncate_mod})")
 
     # ------------------------------------------------------------------ write output (using CPU counts for serialization)
     manifest = write_output(order_indices, tokens_all, counts_all_cpu, tokens_dir, counts_dir, args.shard_size)
