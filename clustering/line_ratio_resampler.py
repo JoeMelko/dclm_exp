@@ -314,7 +314,7 @@ def main(argv: list[str] | None = None):
     sample_ids: List[int] = []
     sample_lines: List[str] = []
 
-    for idx in range(1000):
+    for idx in range(10000):
         key = f"dataset{idx}"
         ratio = ratio_map.get(key)
         if ratio is None:

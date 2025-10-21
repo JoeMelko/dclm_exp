@@ -287,6 +287,10 @@ def get_open_lm_args(args, hparams, dr):
 
     local_rank, _, _ = world_info_from_env()
 
+    # If all shuffling is disabled, force single-worker data loading to preserve exact order
+    if args.no_shuffle and args.workers != 1:
+        args.workers = 1
+
     open_lm_args = [
         "--workers",
         f"{args.workers}",
