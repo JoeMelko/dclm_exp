@@ -183,15 +183,25 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
                       doc_row_norm2: torch.Tensor | None = None) -> list[int]:
     """Greedy ordering using CUDA sparse matrix math on a single GPU."""
 
-    device = counts_all_gpu.device
+    device = counts_sparse_gpu.device
     target_t = torch.as_tensor(target, dtype=torch.float32, device=device)
     n_cluster = target.shape[0]
 
-    n_total = counts_all_gpu.shape[0]
-    seq_len_const = int(counts_all_gpu[0].sum().item())
+    n_total = counts_sparse_gpu.shape[0]
+    _crow_local = counts_sparse_gpu.crow_indices(); _vals_local = counts_sparse_gpu.values()
+    seq_len_const = int(_vals_local[_crow_local[0]:_crow_local[1]].sum().item())
 
-    # Precompute per-sequence norms on device if not provided
-    norms2 = (counts_all_gpu * counts_all_gpu).sum(dim=1)
+    # Precompute per-sequence norms on device if not provided (use CSR if needed)
+    if l2norms is None:
+        crow = counts_sparse_gpu.crow_indices()
+        vals = counts_sparse_gpu.values()
+        counts_per_row = (crow[1:] - crow[:-1]).to(dtype=torch.long)
+        row_ids = torch.repeat_interleave(torch.arange(n_total, dtype=torch.long, device=crow.device), counts_per_row)
+        norms2 = torch.zeros(n_total, dtype=torch.float32, device=vals.device)
+        v = vals.to(dtype=torch.float32)
+        norms2.index_add_(0, row_ids, v * v)
+    else:
+        norms2 = (l2norms.to(device=device, dtype=torch.float32) ** 2)
 
     cum_counts = torch.zeros(n_cluster, dtype=torch.float32, device=device)
     used_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
@@ -303,10 +313,11 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
             if chosen is None:
                 chosen = int(torch.argmin(errs_total).item())
 
-        # Update state
+        # Update state (dense row from single sparse slice as requested)
         used_mask[chosen] = True
-        cum_counts += counts_all_gpu[chosen]
-        chunk_counts += counts_all_gpu[chosen]
+        dense_row = counts_sparse_gpu[chosen:chosen+1].to_dense().squeeze(0).to(dtype=torch.float32)
+        cum_counts += dense_row
+        chunk_counts += dense_row
         order.append(chosen)
         if use_reg:
             if reg_type == "l2sum_schedule":
@@ -534,21 +545,6 @@ def write_manifest(manifest: list[Dict], out_dir: Path,
     print(f'Wrote manifest to {fout}')
 
 
-def chunked_to_sparse_csr(tensor, chunk_size=1024 * 64):
-    chunks = [tensor[i:i+chunk_size].to_sparse_csr() 
-              for i in range(0, tensor.size(0), chunk_size)]
-    
-    values = torch.cat([c.values() for c in chunks])
-    col_indices = torch.cat([c.col_indices() for c in chunks])
-    
-    crow_indices = [chunks[0].crow_indices()]
-    for c in chunks[1:]:
-        crow_indices.append(c.crow_indices()[1:] + crow_indices[-1][-1])
-    crow_indices = torch.cat(crow_indices)
-    
-    return torch.sparse_csr_tensor(crow_indices, col_indices, values, size=tensor.size())
-
-
 # --------------------------------------------------------------------------- #
 # Entry-point                                                                 #
 # --------------------------------------------------------------------------- #
@@ -608,13 +604,13 @@ def main():
         workers=args.loader_workers,
         prefetch=args.loader_prefetch,
     )
-
     # If ratio file is provided, read it and validate; else infer from data
     if args.ratio_file:
         target = read_ratio_file(Path(args.ratio_file))
         if len(target) != n_cluster:
             raise ValueError(f"Ratio file has {len(target)} clusters but data has {n_cluster}")
     else:
+        breakpoint()
         totals = counts_all_cpu.sum(dim=0).to(dtype=torch.float64)
         total_sum = float(totals.sum().item())
         if total_sum == 0.0:
@@ -633,13 +629,20 @@ def main():
     else:
         dty = torch.float32
 
-    counts_all_gpu = counts_all_cpu.to(device=device, dtype=dty)
-    # Build CSR directly on GPU to avoid duplicating CSR on CPU
-    #counts_sparse_gpu = counts_all_gpu.to_sparse_csr()
-    counts_sparse_gpu = chunked_to_sparse_csr(counts_all_gpu)
+    # Build CSR on CPU and move to GPU to avoid dense GPU allocation
+    breakpoint()
+    counts_sparse_gpu = counts_all_cpu.to_sparse_csr().to(device=device)
 
-    # Precompute per-sequence L2 norms and their total sum for regularization (on GPU)
-    l2norms = torch.sqrt((counts_all_gpu * counts_all_gpu).sum(dim=1).to(dtype=torch.float32))
+    # Precompute per-sequence L2 norms and their total sum from CSR on GPU
+    _crow = counts_sparse_gpu.crow_indices()
+    _vals = counts_sparse_gpu.values()
+    _N = int(counts_sparse_gpu.shape[0])
+    _counts_per_row = (_crow[1:] - _crow[:-1]).to(dtype=torch.long)
+    _row_ids = torch.repeat_interleave(torch.arange(_N, dtype=torch.long, device=_crow.device), _counts_per_row)
+    _norms2 = torch.zeros(_N, dtype=torch.float32, device=_vals.device)
+    _v = _vals.to(dtype=torch.float32)
+    _norms2.index_add_(0, _row_ids, _v * _v)
+    l2norms = torch.sqrt(_norms2)
     total_l2_sum = float(l2norms.sum().item())
 
     # Histogram regularizer precomputation if requested (on GPU)
@@ -733,7 +736,7 @@ def main():
     debug_log_path = str(out_dir / "debug.json")
 
     order_indices = greedy_gpu_sparse(
-        counts_all_gpu,
+        None,
         counts_sparse_gpu,
         target,
         k_return=1,
@@ -754,6 +757,15 @@ def main():
         doc_row_norm2=doc_row_norm2,
     )
 
+    # Optionally truncate the final ordered list to a multiple of --truncate-mod
+    truncate_mod = int(getattr(args, 'truncate_mod', 0) or 0)
+    if truncate_mod > 0:
+        remainder = len(order_indices) % truncate_mod
+        if remainder != 0:
+            orig_len = len(order_indices)
+            order_indices = order_indices[:-remainder]
+            print(f"Truncated ordered sequences from {orig_len} to {len(order_indices)} (multiple of {truncate_mod})")
+
     # Optionally discard a ratio of sequences from the tail of the ordered list
     discard_ratio = float(getattr(args, 'discard_ratio', 0.0) or 0.0)
     if discard_ratio > 0.0:
@@ -763,15 +775,6 @@ def main():
             orig_len = len(order_indices)
             order_indices = order_indices[:keep_n]
             print(f"Applied discard ratio {discard_ratio:.4f}: keeping {keep_n} of {orig_len} sequences")
-
-    # Optionally truncate the final ordered list to a multiple of --truncate-mod
-    truncate_mod = int(getattr(args, 'truncate_mod', 0) or 0)
-    if truncate_mod > 0:
-        remainder = len(order_indices) % truncate_mod
-        if remainder != 0:
-            orig_len = len(order_indices)
-            order_indices = order_indices[:-remainder]
-            print(f"Truncated ordered sequences from {orig_len} to {len(order_indices)} (multiple of {truncate_mod})")
 
     # ------------------------------------------------------------------ write output (using CPU counts for serialization)
     manifest = write_output(order_indices, tokens_all, counts_all_cpu, tokens_dir, counts_dir, args.shard_size)
