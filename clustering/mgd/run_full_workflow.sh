@@ -28,13 +28,13 @@ set -euo pipefail
 ##################################
 # -------- General paths -------- #
 PROJECT_DIR="$(dirname "$(realpath "$0")")"   # this script lives in clustering/mgd
-DATA_PARENT_DIR="/home/jmelko/400m_tok"             # <- directory whose *sub-dirs* are processed by run_collect_all_multi.sh
-WDS_DIR="/home/jmelko/mgd/four_3_dir/d_dot2"                     # <- tokenised WebDataset root used by later stages
-OH_DIR="/home/jmelko/openhermes_tok"
+DATA_PARENT_DIR="/mnt/eu/home/jmelko/curric/400m_tok"             # <- directory whose *sub-dirs* are processed by run_collect_all_multi.sh
+WDS_DIR="/mnt/eu/home/jmelko/curric/baseline0_chunked/ready_to_train"                     # <- tokenised WebDataset root used by later stages
+OH_DIR="/mnt/eu/home/jmelko/curric/openhermes_tok_new"
 
 # -------- Model checkpoint ----- #
 # Exactly *one* of UUID or CKPT must be defined.  Leave the unused one empty.
-MODEL_UUID="four_iter3_ckpt4-d=1024_l=24_h=8-warm=2000-lr=0p003-wd=0p033-cd=3e-05-bs=512-mult=1-seed=124-tokens=8232325120"         # Datacomp-LM / Open-LM run UUID (preferred)
+MODEL_UUID="baseline_mgd_iter0_split8-d=1024_l=24_h=8-warm=2000-lr=0p003-wd=0p033-cd=3e-05-bs=512-mult=1-seed=124-tokens=8232325120"         # Datacomp-LM / Open-LM run UUID (preferred)
 MODEL_CKPT=""         # HuggingFace checkpoint path or hub ID (fallback)
 
 # -------- LoRA dimensions ------ #
@@ -42,27 +42,27 @@ LORA_RANK=128
 NUM_BLOCKS=8
 
 # -------- Hessian computation ---#
-GRAD_MEMMAP="/home/jmelko/mgd/four_4_dir/grads.mmap"     # mem-mapped gradient features (input for hessian.py)
+GRAD_MEMMAP="/mnt/eu/home/jmelko/curric/mgd/iter0/grads.mmap"     # mem-mapped gradient features (input for hessian.py)
 COND_TARGET=1e4                        # target condition number after ridge regularisation
-WHITENERS_PATH="/home/jmelko/mgd/four_4_dir/whiteners.npy"        # output file written by hessian.py
+WHITENERS_PATH="/mnt/eu/home/jmelko/curric/mgd/iter0/whiteners.npy"        # output file written by hessian.src.py
 
 # -------- Target aggregation ---- #
 NUM_GPUS=8                             # number of GPU workers launched by launch_get_target.sh
 SHARDS_PER_GPU=15                      # chunk-size handed to each get_target worker
 SHARD_SIZE=8192                        # samples per shard
-TARGET_DIR="/home/jmelko/mgd/four_4_dir/targets"                  # directory that will contain sum_*.npy (created automatically)
+TARGET_DIR="/mnt/eu/home/jmelko/curric/mgd/iter0/targets"                  # directory that will contain sum_*.npy (created automatically)
 
 # -------- Condition / whitening --#
-WHITENED_TARGET="/home/jmelko/mgd/four_4_dir/hw_target.npy" # 1-D, unit-norm vector consumed by run_collect_all_multi.sh
+WHITENED_TARGET="/mnt/eu/home/jmelko/curric/mgd/iter0/hw_target.npy" # 1-D, unit-norm vector consumed by run_collect_all_multi.sh
 
 # --- Feature collection / mmap -- #
-FEATURE_MEMMAP="/home/jmelko/mgd/four_4_dir/grads.mmap"         # destination memmap initialised by create_mmap_features.py
+FEATURE_MEMMAP="/mnt/eu/home/jmelko/curric/mgd/iter0/grads.mmap"         # destination memmap initialised by create_mmap_features.py
 CF_SHARDS_PER_GPU=2048                   # shards per GPU for collect_features
 CF_SHARD_SIZE=64
 
 # -------- Cosine-similarity eval ---- #
-ITER=4                               # iteration index forwarded to collect_cosine_sim_multi.py
-OUT_DIR="/home/jmelko/mgd/four_4_dir"            # base directory where similarity results will be written
+ITER=0                               # iteration index forwarded to collect_cosine_sim_multi.py
+OUT_DIR="/mnt/eu/home/jmelko/curric/mgd/iter0"            # base directory where similarity results will be written
 MAX_ITEMS=64                        # maximum number of batches processed per dataset
 HESSIAN_DTYPE="fp16"                # storage dtype of the gradient memmap
 CLIP_PERCENTILE=99.9                # clipping threshold percentile
@@ -210,5 +210,40 @@ echo "[workflow] Stage 5/5 – run_collect_all_multi.sh"
     --max-items "${MAX_ITEMS}"
 
 echo "[workflow] Stage 5 complete – cosine similarity collection finished."
+
+# -----------------------------------------------------------------------------
+# 6) Post-processing – update sampling logits (update_logits.py)
+# -----------------------------------------------------------------------------
+
+echo "[workflow] Post-processing – update_logits.py"
+
+# Require COUNTS_JSON (the current cluster counts JSON used to build the dataset)
+if [[ -z "${COUNTS_JSON:-}" ]]; then
+  echo "ERROR: Please export COUNTS_JSON=/path/to/current_counts.json before running." >&2
+  exit 1
+fi
+
+# Locate the scores directory produced in Stage 5 (expects dataset{i}.npz with 'dot' and 'l2')
+SCORES_DIR="$(dirname "$(find "${OUT_DIR}" -type f -name 'dataset0.npz' -print -quit)")"
+if [[ -z "${SCORES_DIR}" ]]; then
+  SCORES_DIR="$(dirname "$(find "${OUT_DIR}" -type f -name 'dataset*.npz' -print -quit)")"
+fi
+if [[ -z "${SCORES_DIR}" ]]; then
+  echo "ERROR: Could not locate 'dataset*.npz' under ${OUT_DIR}." >&2
+  exit 1
+fi
+
+UPDATED_COUNTS="${OUT_DIR}/updated_counts_iter${ITER}.json"
+MEANS_OUT="${OUT_DIR}/scaled_means_iter${ITER}.json"
+
+python "${PROJECT_DIR}/update_logits.py" \
+  --counts "${COUNTS_JSON}" \
+  --scores-dir "${SCORES_DIR}" \
+  --out-path "${UPDATED_COUNTS}" \
+  --lr 0.2 \
+  --max-z 5 \
+  --means-out "${MEANS_OUT}"
+
+echo "[workflow] Post-processing complete – updated counts saved to ${UPDATED_COUNTS}"
 
 echo "[workflow] All stages finished successfully. ✨" 
