@@ -59,7 +59,7 @@ def add_dcnlp_args(parser):
     parser.add_argument(
         "--num-checkpoints",
         type=int,
-        default=5,
+        default=10,
         help="Number of times we save checkpoints during training.",
     )
     parser.add_argument("--seed", type=int, default=124, help="Random seed.")
