@@ -18,6 +18,7 @@ This directory contains disjoint but composable tools for cluster-based data wei
 - Produce a ratios JSON keyed by dataset<i>.
 - Interpret ratios as per-cluster retention factors ("how much of this cluster to keep"), not as global mixture proportions. Manual conversion from weights/logits to these ratios is required at the moment.
 - Input: updated weights JSON from the MGD pipeline. Output: ratios.json for resampling.
+- Helper: `counts_to_line_ratios.py` converts counts → ratios: `ratio=cur/base` (0 if base≤0); optional `--keep-ratio` scalar. Example: `python -m dclm_exp.clustering.counts_to_line_ratios --counts0 baseline.json --counts-cur current.json --out ratios.json`.
 
 2) Sample and tokenize
 - Use `line_ratio_resampler.py` to materialize sampled lines per cluster. Output is a processed directory of evenly sized shards (with optional cluster indices).
