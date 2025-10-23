@@ -546,6 +546,35 @@ def write_manifest(manifest: list[Dict], out_dir: Path,
 
 
 # --------------------------------------------------------------------------- #
+# Sparse construction helper                                                  #
+# --------------------------------------------------------------------------- #
+def chunked_to_sparse_csr(tensor, chunk_size=1024 * 64):
+    chunks = [tensor[i:i+chunk_size].to_sparse_csr() 
+              for i in range(0, tensor.size(0), chunk_size)]
+    values = torch.cat([c.values() for c in chunks])
+    col_indices = torch.cat([c.col_indices() for c in chunks])
+    crow_indices = [chunks[0].crow_indices()]
+    for c in chunks[1:]:
+        crow_indices.append(c.crow_indices()[1:] + crow_indices[-1][-1])
+    crow_indices = torch.cat(crow_indices)
+    return torch.sparse_csr_tensor(crow_indices, col_indices, values, size=tensor.size())
+
+
+# --------------------------------------------------------------------------- #
+# Chunked reductions                                                          #
+# --------------------------------------------------------------------------- #
+def chunked_sum_dim0(tensor: torch.Tensor, chunk_rows: int = 1024 * 64, dtype: torch.dtype = torch.float64) -> torch.Tensor:
+    n_cols = int(tensor.shape[1])
+    total = torch.zeros(n_cols, dtype=dtype, device='cpu')
+    # Accumulate per chunk to avoid large intermediate allocations
+    for start in range(0, tensor.shape[0], chunk_rows):
+        end = min(start + chunk_rows, tensor.shape[0])
+        # sum with dtype to upcast without materializing a big temporary
+        total += tensor[start:end].sum(dim=0, dtype=dtype).to(device='cpu')
+    return total
+
+
+# --------------------------------------------------------------------------- #
 # Entry-point                                                                 #
 # --------------------------------------------------------------------------- #
 def main():
@@ -610,8 +639,7 @@ def main():
         if len(target) != n_cluster:
             raise ValueError(f"Ratio file has {len(target)} clusters but data has {n_cluster}")
     else:
-        breakpoint()
-        totals = counts_all_cpu.sum(dim=0).to(dtype=torch.float64)
+        totals = chunked_sum_dim0(counts_all_cpu, chunk_rows=1024*64, dtype=torch.float64)
         total_sum = float(totals.sum().item())
         if total_sum == 0.0:
             raise ValueError("Total token count across all clusters is zero; cannot infer ratios")
@@ -629,9 +657,8 @@ def main():
     else:
         dty = torch.float32
 
-    # Build CSR on CPU and move to GPU to avoid dense GPU allocation
-    breakpoint()
-    counts_sparse_gpu = counts_all_cpu.to_sparse_csr().to(device=device)
+    # Build CSR on CPU in chunks with requested dtype, then move to GPU
+    counts_sparse_gpu = chunked_to_sparse_csr(counts_all_cpu.to(dtype=dty)).to(device=device)
 
     # Precompute per-sequence L2 norms and their total sum from CSR on GPU
     _crow = counts_sparse_gpu.crow_indices()
@@ -757,15 +784,6 @@ def main():
         doc_row_norm2=doc_row_norm2,
     )
 
-    # Optionally truncate the final ordered list to a multiple of --truncate-mod
-    truncate_mod = int(getattr(args, 'truncate_mod', 0) or 0)
-    if truncate_mod > 0:
-        remainder = len(order_indices) % truncate_mod
-        if remainder != 0:
-            orig_len = len(order_indices)
-            order_indices = order_indices[:-remainder]
-            print(f"Truncated ordered sequences from {orig_len} to {len(order_indices)} (multiple of {truncate_mod})")
-
     # Optionally discard a ratio of sequences from the tail of the ordered list
     discard_ratio = float(getattr(args, 'discard_ratio', 0.0) or 0.0)
     if discard_ratio > 0.0:
@@ -775,6 +793,15 @@ def main():
             orig_len = len(order_indices)
             order_indices = order_indices[:keep_n]
             print(f"Applied discard ratio {discard_ratio:.4f}: keeping {keep_n} of {orig_len} sequences")
+
+    # Optionally truncate the final ordered list to a multiple of --truncate-mod
+    truncate_mod = int(getattr(args, 'truncate_mod', 0) or 0)
+    if truncate_mod > 0:
+        remainder = len(order_indices) % truncate_mod
+        if remainder != 0:
+            orig_len = len(order_indices)
+            order_indices = order_indices[:-remainder]
+            print(f"Truncated ordered sequences from {orig_len} to {len(order_indices)} (multiple of {truncate_mod})")
 
     # ------------------------------------------------------------------ write output (using CPU counts for serialization)
     manifest = write_output(order_indices, tokens_all, counts_all_cpu, tokens_dir, counts_dir, args.shard_size)
