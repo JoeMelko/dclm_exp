@@ -1,189 +1,58 @@
-# Cluster-Aware Data-Curation & Model-Guided Data (MGD) Pipeline
+### clustering/ – brief workflow guide
 
-> Sub-directory: `dclm_exp/clustering/`
->
-> This pipeline turns **one Datacomp-LM local shard** (~ 40 B tokens / 40 M docs) into **tokenised per-cluster WebDataset shards** and then iteratively re-weights those clusters with a model-guided signal.
+This directory contains disjoint but composable tools for cluster-based data weighting and ordering. Below are the minimal usage patterns and goals for how they fit together.
 
----
-## 0 .  Requirements
+### MGD pipeline (run_full_workflow.sh)
 
-* **Hardware**  • 1 node, 8 × H100-80 GB (other multi-GPU cards also work; tune batch sizes accordingly).
-* **Python**    • 3.10 +
-* **Packages**  • install once:
+- Goal: given the latest training checkpoint and clustering setup, compute updated sampling weights for clusters.
+- Pattern: sequential stages – collect features → compute whiteners (regularised Fisher) → aggregate/whiten target → collect per-dataset cosine sims → update logits/weights.
+- Inputs: model checkpoint/UUID, tokenised WDS, OpenHermes target corpus, LoRA dims, iteration index.
+- Key artifacts (paths are configured in the script):
+  - grads.mmap → whiteners.npy → targets/sum_*.npy → hw_target.npy
+  - OUT_DIR/dataset{i}.npz (cosine metrics) → updated_counts_iter{ITER}.json (new weights)
+- Output: updated counts/weights JSON for the current iteration (plus diagnostics). This is the hand-off for dataset construction in the next section.
 
-```bash
-pip install "transformers>=4.51" sentence-transformers>=2.7.0 \
-            accelerate datasets faiss-gpu numpy tqdm zstandard \
-            webdataset blake3 torch scikit-learn scipy
-```
+### From weights to a new dataset/run
 
----
-## 1 .  Directory Layout (convention)
+1) Convert weights → ratios for `line_ratio_resampler.py` (manual)
+- Produce a ratios JSON keyed by dataset<i>.
+- Interpret ratios as per-cluster retention factors ("how much of this cluster to keep"), not as global mixture proportions. Manual conversion from weights/logits to these ratios is required at the moment.
+- Input: updated weights JSON from the MGD pipeline. Output: ratios.json for resampling.
 
-```
-dclm_exp/
-├── data/              # raw input shards
-├── embeddings/        # dense vectors (.fp16)
-├── clusters.tsv       # row_id <TAB> cluster_id
-├── cluster_jsonl/     # raw docs per cluster
-├── balanced/          # size-balanced jsonl per cluster (optional)
-├── tok/               # tokenised WebDataset shards
-├── openhermes/        # OpenHermes jsonl / features
-└── ckpt/              # model checkpoints & whitening stats
-```
+2) Sample and tokenize
+- Use `line_ratio_resampler.py` to materialize sampled lines per cluster. Output is a processed directory of evenly sized shards (with optional cluster indices).
+- Tokenize the sampled text in parallel via `ordered_tokenize_chunks.sh` to produce `shard_*.tar` token archives (and `*_counts.pt`).
 
----
-## 2 .  Download the Shard (Datacomp-LM)
+3) Group/symlink token shards
+- Use `link_chunked_ordered_tokens.sh` to symlink chunked token tars (and counts) into contiguous group directories (sequential `shard_%08d` naming) for downstream ordering.
+- Input: chunk roots; Output: `group_*` directories with symlinked token/count shard pairs.
 
-```bash
-aws s3 cp --recursive \
-  s3://commoncrawl/contrib/datacomp/DCLM-baseline/global-shard_01_of_10/local-shard_1_of_10/ \
-  data/gs01_ls1
-```
+4) Order sequences by cluster target
+- Current: `greedy_order_sparse_gpu.py` to produce ordered token shards + counts, aligned to the target ratios.
+- Moving to: `greedy_order_sparse_gpu_clean.py` (preferred; better sparse handling and memory). Same goal/outputs.
+- Inputs: grouped token shards + counts, optional ratio file; Outputs: `out_dir/tokens/shard_*.tar`, `out_dir/counts/shard_*.tar`, `manifest.jsonl`, and logs.
 
----
-## 3 .  Embed Every Document
+5) Concatenate if produced in chunks
+- Use `merge_ds_symlink.py` to concatenate multiple ordered groups into a single dataset directory via symlinks and a fresh manifest.
+- Input: one or more ordered group directories; Output: merged dataset with sequential shard naming and consolidated `manifest.jsonl`.
 
-```bash
-python embed.py \
-  --shard-dir data/gs01_ls1 \
-  --model sentence-transformers/all-mpnet-base-v2 \
-  --batch-size 2048 \
-  --fp16 \
-  --out embeddings/embeddings.fp16
-```
+6) Register dataset and train
+- Manually create the dataset artifact under `exp_data/datasets/` pointing to the final dataset directory. Then launch the next model run consuming it (configs in `training/`).
+- Output: a new run UUID with metrics and checkpoints under `exp_data/models/`.
 
----
-## 4 .  K-Means Clustering
+7) Set next-step checkpoint
+- After the run finishes, manually update the checkpoint field in the resulting run UUID JSON under `exp_data/models/` to seed the next MGD iteration.
 
-```bash
-python kmeans.py \
-  --embeddings embeddings/embeddings.fp16 \
-  --n-clusters 10000 \
-  --sample 3000000 \
-  --out clusters.tsv
-```
-`clusters.tsv` holds `row_id<TAB>cluster_id` for **all** documents.
+### Notes and pitfalls
 
----
-## 5 .  Extract Raw Docs per Cluster
+- Ratios semantics: ratios are retention factors per cluster (relative keep amounts), not a full-dataset mixture distribution. Converting weights/logits → ratios is manual and impacts sampling volume directly.
+- Chunking: ordering can be run per group/chunk to fit memory; merge later via symlinks to avoid copying.
+- Counts alignment: ensure `*_counts.pt` tensors correspond 1:1 with token sequences when ordering. Mismatches will fail fast.
+- GPU memory: prefer the `greedy_order_sparse_gpu_clean.py` variant for large corpora; it avoids dense copies and computes norms from CSR on-device.
+- Determinism: where order matters across iterations, fix seeds in resampling and tokenization steps.
 
-```bash
-export SHARD_ROOT=data/gs01_ls1
-parallel -j 32 "\
-  awk -v k={1} '\$2==k {print \$1}' clusters.tsv > tmp_ids_k.txt && \
-  python extract_cluster.py \
-    --row-ids tmp_ids_k.txt \
-    --shard-root $SHARD_ROOT \
-    --out-jsonl cluster_jsonl/cluster_{1}.jsonl" ::: $(seq 0 9999)
-```
+### Planned
 
----
-## 6 .  (Optional) Balance Cluster Sizes
-
-```bash
-python balanced_resample.py \
-  --indir  cluster_jsonl/cluster_{k}.jsonl \
-  --outdir balanced/cluster_{k} \
-  --n      250_000      # target rows per cluster
-```
-Repeat for each `k` (GNU parallel works well).
-
----
-## 7 .  Tokenise & Shuffle (WebDataset)
-
-```bash
-cargo run --release -- \
-   --input balanced/cluster_{k} \
-   --output tok/cluster_{k} \
-   --tokenizer EleutherAI/gpt-neox-20b \
-   --seqlen 2049 --wds-chunk-size 8192
-```
-Run once per cluster (`k`).
-
----
-## 8 .  Process OpenHermes for MGD
-
-```bash
-# download
-wget https://huggingface.co/datasets/nomic-ai/gpt4all-j-prompt-generations/raw/main/openhermes_2.jsonl.gz
-gzip -d openhermes_2.jsonl.gz -c > openhermes/openhermes.jsonl
-
-# embed (same model as above)
-python embed.py \
-  --shard-dir openhermes \
-  --input-json openhermes.jsonl \
-  --out openhermes/features.fp16
-```
-
----
-## 9 .  Model-Guided Data (MGD) Loop
-
-Below is **one** outer iteration.  Wrap B→E in a bash or Python loop for multiple rounds.
-
-### A.  Initialise Cluster Logits
-
-```python
-import numpy as np, pandas as pd
-
-df = pd.read_csv("clusters.tsv", sep="\t", names=["row", "cid"])
-counts = df.groupby("cid").size().reindex(range(10000), fill_value=0)
-logits = np.log(counts + 1e-6)  # avoid -inf
-np.save("mgd_logits.npy", logits)
-```
-
-### B.  Train with Current Weights
-
-```bash
-torchrun --nproc_per_node 8 train.py \
-  --train-shards "tok/cluster_{cid}/**/*.tar" \
-  --cluster-logits mgd_logits.npy \
-  --output-dir ckpt/iter0 \
-  --per-device-train-batch-size 2 \
-  --gradient-accumulation-steps 32 \
-  --lr 2e-5 --warmup 0.03 --epochs 1
-```
-`train.py` must softmax `mgd_logits.npy` and sample proportionally.
-
-### C.  Compute Whitening Matrix + Mean Direction
-
-```bash
-python compute_whitening.py \
-  --features openhermes/features.fp16 \
-  --output  ckpt/iter0/whitening.npz
-```
-
-### D.  Score Cluster Agreement
-
-```bash
-python cluster_agreement.py \
-  --whitening ckpt/iter0/whitening.npz \
-  --cluster-feats-dir embeddings/ \
-  --clusters-tsv clusters.tsv \
-  --out scores.npy
-```
-
-### E.  Update Logits
-
-```python
-import numpy as np
-logits  = np.load("mgd_logits.npy")
-scores  = np.load("scores.npy")
-# scale to −1 … 1
-scores  = 2 * (scores - scores.min()) / (scores.ptp() + 1e-9) - 1
-logits += 0.5 * scores   # temperature 0.5; tune as needed
-np.save("mgd_logits.npy", logits)
-```
-
-### F.  Repeat
-Use the updated `mgd_logits.npy` in the next call to **B**.
-
----
-## Notes
-
-* Every script referenced lives in `dclm_exp/clustering/`.
-* Adjust `--nproc_per_node`, `--batch-size`, etc. for other hardware.
-* When training with enforced ordering, set `--workers 1` to preserve order.
-* For production-scale runs, move large intermediates to S3/GCS and stream.
+- `run_full_workflow.sh` will be extended to accept multiple checkpoints to learn a curriculum (instead of a single set of static data weights). The downstream steps remain the same; only the weight update stage produces curriculum-aware weights.
 
 
