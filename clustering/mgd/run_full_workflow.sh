@@ -28,50 +28,50 @@ set -euo pipefail
 ##################################
 # -------- General paths -------- #
 PROJECT_DIR="$(dirname "$(realpath "$0")")"   # this script lives in clustering/mgd
-DATA_PARENT_DIR="/mnt/eu/home/jmelko/curric/400m_tok"             # <- directory whose *sub-dirs* are processed by run_collect_all_multi.sh
-WDS_DIR="/mnt/eu/home/jmelko/curric/mgd/iter2/ready_to_train"                     # <- tokenised WebDataset root used by later stages
-OH_DIR="/mnt/eu/home/jmelko/curric/openhermes_tok_new"
+: "${DATA_PARENT_DIR:=/mnt/eu/home/jmelko/curric/400m_tok}"             # <- directory whose *sub-dirs* are processed by run_collect_all_multi.sh
+: "${WDS_DIR:=/mnt/eu/home/jmelko/curric/mgd/iter2/ready_to_train}"                     # <- tokenised WebDataset root used by later stages
+: "${OH_DIR:=/mnt/eu/home/jmelko/curric/openhermes_tok_new}"
 
 # -------- Model checkpoint ----- #
 # Exactly *one* of UUID or CKPT must be defined.  Leave the unused one empty.
-MODEL_UUID="baseline_mgd_iter2_split8-d=1024_l=24_h=8-warm=2000-lr=0p003-wd=0p033-cd=3e-05-bs=512-mult=1-seed=124-tokens=8232325120"         # Datacomp-LM / Open-LM run UUID (preferred)
-MODEL_CKPT=""         # HuggingFace checkpoint path or hub ID (fallback)
+: "${MODEL_UUID:=baseline_mgd_iter2_split8-d=1024_l=24_h=8-warm=2000-lr=0p003-wd=0p033-cd=3e-05-bs=512-mult=1-seed=124-tokens=8232325120}"         # Datacomp-LM / Open-LM run UUID (preferred)
+: "${MODEL_CKPT:=}"         # HuggingFace checkpoint path or hub ID (fallback)
 
 # -------- LoRA dimensions ------ #
-LORA_RANK=128
-NUM_BLOCKS=8
+: "${LORA_RANK:=128}"
+: "${NUM_BLOCKS:=8}"
 
 # -------- Hessian computation ---#
-GRAD_MEMMAP="/mnt/eu/home/jmelko/curric/mgd/iter2/grads.mmap"     # mem-mapped gradient features (input for hessian.py)
-COND_TARGET=1e4                        # target condition number after ridge regularisation
-WHITENERS_PATH="/mnt/eu/home/jmelko/curric/mgd/iter2/whiteners.npy"        # output file written by hessian.src.py
+: "${GRAD_MEMMAP:=/mnt/eu/home/jmelko/curric/mgd/iter2_fix/grads.mmap}"     # mem-mapped gradient features (input for hessian.py)
+: "${COND_TARGET:=1e4}"                        # target condition number after ridge regularisation
+: "${WHITENERS_PATH:=/mnt/eu/home/jmelko/curric/mgd/iter2_fix/whiteners.npy}"        # output file written by hessian.src.py
 
 # -------- Target aggregation ---- #
-NUM_GPUS=8                             # number of GPU workers launched by launch_get_target.sh
-SHARDS_PER_GPU=15                      # chunk-size handed to each get_target worker
-SHARD_SIZE=8192                        # samples per shard
-TARGET_DIR="/mnt/eu/home/jmelko/curric/mgd/iter2/targets"                  # directory that will contain sum_*.npy (created automatically)
+: "${NUM_GPUS:=8}"                             # number of GPU workers launched by launch_get_target.sh
+: "${SHARDS_PER_GPU:=15}"                      # chunk-size handed to each get_target worker
+: "${SHARD_SIZE:=8192}"                        # samples per shard
+: "${TARGET_DIR:=/mnt/eu/home/jmelko/curric/mgd/iter2_fix/targets}"                  # directory that will contain sum_*.npy (created automatically)
 
 # -------- Condition / whitening --#
-WHITENED_TARGET="/mnt/eu/home/jmelko/curric/mgd/iter2/hw_target.npy" # 1-D, unit-norm vector consumed by run_collect_all_multi.sh
+: "${WHITENED_TARGET:=/mnt/eu/home/jmelko/curric/mgd/iter2_fix/hw_target.npy}" # 1-D, unit-norm vector consumed by run_collect_all_multi.sh
 
 # --- Feature collection / mmap -- #
-FEATURE_MEMMAP="/mnt/eu/home/jmelko/curric/mgd/iter2/grads.mmap"         # destination memmap initialised by create_mmap_features.py
-CF_SHARDS_PER_GPU=2048                   # shards per GPU for collect_features
-CF_SHARD_SIZE=64
+: "${FEATURE_MEMMAP:=/mnt/eu/home/jmelko/curric/mgd/iter2_fix/grads.mmap}"         # destination memmap initialised by create_mmap_features.py
+: "${CF_SHARDS_PER_GPU:=2048}"                   # shards per GPU for collect_features
+: "${CF_SHARD_SIZE:=64}"
 
 # -------- Cosine-similarity eval ---- #
-ITER=2                               # iteration index forwarded to collect_cosine_sim_multi.py
-OUT_DIR="/mnt/eu/home/jmelko/curric/mgd/iter2"            # base directory where similarity results will be written
-MAX_ITEMS=64                        # maximum number of batches processed per dataset
-HESSIAN_DTYPE="fp16"                # storage dtype of the gradient memmap
-CLIP_PERCENTILE=99.9                # clipping threshold percentile
-COND_DTYPE="fp32"                  # output dtype for condition.py
+: "${ITER:=2}"                               # iteration index forwarded to collect_cosine_sim_multi.py
+: "${OUT_DIR:=/mnt/eu/home/jmelko/curric/mgd/iter2_fix}"            # base directory where similarity results will be written
+: "${MAX_ITEMS:=64}"                        # maximum number of batches processed per dataset
+: "${HESSIAN_DTYPE:=fp16}"                # storage dtype of the gradient memmap
+: "${CLIP_PERCENTILE:=99.9}"                # clipping threshold percentile
+: "${COND_DTYPE:=fp32}"                  # output dtype for condition.py
 # -------- Post-processing (step 6) ---- #
-COUNTS_JSON="/mnt/eu/home/jmelko/curric/mgd/iter1/updated_counts_iter1.json"                     # REQUIRED: path to current cluster counts JSON used to build the dataset
-STEP6_SCORES_DIR=""               # Optional: override scores dir; if empty, auto-detect under OUT_DIR
-UPDATE_LR=0.1                     # Learning rate for update_logits.py
-UPDATE_MAX_Z=5                     # Maximum z-score for update_logits.py
+: "${COUNTS_JSON:=/mnt/eu/home/jmelko/curric/mgd/iter1/updated_counts_iter1.json}"                     # REQUIRED: path to current cluster counts JSON used to build the dataset
+: "${STEP6_SCORES_DIR:=}"               # Optional: override scores dir; if empty, auto-detect under OUT_DIR
+: "${UPDATE_LR:=0.1}"                     # Learning rate for update_logits.py
+: "${UPDATE_MAX_Z:=5}"                     # Maximum z-score for update_logits.py
 ##################################
 #  ⁕  USER  CONFIGURATION END   ⁕  
 ##################################
