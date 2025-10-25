@@ -28,45 +28,50 @@ set -euo pipefail
 ##################################
 # -------- General paths -------- #
 PROJECT_DIR="$(dirname "$(realpath "$0")")"   # this script lives in clustering/mgd
-DATA_PARENT_DIR="/mnt/eu/home/jmelko/curric/400m_tok"             # <- directory whose *sub-dirs* are processed by run_collect_all_multi.sh
-WDS_DIR="/mnt/eu/home/jmelko/curric/baseline0_chunked/ready_to_train"                     # <- tokenised WebDataset root used by later stages
-OH_DIR="/mnt/eu/home/jmelko/curric/openhermes_tok_new"
+: "${DATA_PARENT_DIR:=/mnt/eu/home/jmelko/curric/400m_tok}"             # <- directory whose *sub-dirs* are processed by run_collect_all_multi.sh
+: "${WDS_DIR:=/mnt/eu/home/jmelko/curric/mgd/iter2/ready_to_train}"                     # <- tokenised WebDataset root used by later stages
+: "${OH_DIR:=/mnt/eu/home/jmelko/curric/openhermes_tok_new}"
 
 # -------- Model checkpoint ----- #
 # Exactly *one* of UUID or CKPT must be defined.  Leave the unused one empty.
-MODEL_UUID="baseline_mgd_iter0_split8-d=1024_l=24_h=8-warm=2000-lr=0p003-wd=0p033-cd=3e-05-bs=512-mult=1-seed=124-tokens=8232325120"         # Datacomp-LM / Open-LM run UUID (preferred)
-MODEL_CKPT=""         # HuggingFace checkpoint path or hub ID (fallback)
+: "${MODEL_UUID:=baseline_mgd_iter2_split8-d=1024_l=24_h=8-warm=2000-lr=0p003-wd=0p033-cd=3e-05-bs=512-mult=1-seed=124-tokens=8232325120}"         # Datacomp-LM / Open-LM run UUID (preferred)
+: "${MODEL_CKPT:=}"         # HuggingFace checkpoint path or hub ID (fallback)
 
 # -------- LoRA dimensions ------ #
-LORA_RANK=128
-NUM_BLOCKS=8
+: "${LORA_RANK:=128}"
+: "${NUM_BLOCKS:=8}"
 
 # -------- Hessian computation ---#
-GRAD_MEMMAP="/mnt/eu/home/jmelko/curric/mgd/iter0/grads.mmap"     # mem-mapped gradient features (input for hessian.py)
-COND_TARGET=1e4                        # target condition number after ridge regularisation
-WHITENERS_PATH="/mnt/eu/home/jmelko/curric/mgd/iter0/whiteners.npy"        # output file written by hessian.src.py
+: "${GRAD_MEMMAP:=/mnt/eu/home/jmelko/curric/mgd/iter2_fix/grads.mmap}"     # mem-mapped gradient features (input for hessian.py)
+: "${COND_TARGET:=1e4}"                        # target condition number after ridge regularisation
+: "${WHITENERS_PATH:=/mnt/eu/home/jmelko/curric/mgd/iter2_fix/whiteners.npy}"        # output file written by hessian.src.py
 
 # -------- Target aggregation ---- #
-NUM_GPUS=8                             # number of GPU workers launched by launch_get_target.sh
-SHARDS_PER_GPU=15                      # chunk-size handed to each get_target worker
-SHARD_SIZE=8192                        # samples per shard
-TARGET_DIR="/mnt/eu/home/jmelko/curric/mgd/iter0/targets"                  # directory that will contain sum_*.npy (created automatically)
+: "${NUM_GPUS:=8}"                             # number of GPU workers launched by launch_get_target.sh
+: "${SHARDS_PER_GPU:=15}"                      # chunk-size handed to each get_target worker
+: "${SHARD_SIZE:=8192}"                        # samples per shard
+: "${TARGET_DIR:=/mnt/eu/home/jmelko/curric/mgd/iter2_fix/targets}"                  # directory that will contain sum_*.npy (created automatically)
 
 # -------- Condition / whitening --#
-WHITENED_TARGET="/mnt/eu/home/jmelko/curric/mgd/iter0/hw_target.npy" # 1-D, unit-norm vector consumed by run_collect_all_multi.sh
+: "${WHITENED_TARGET:=/mnt/eu/home/jmelko/curric/mgd/iter2_fix/hw_target.npy}" # 1-D, unit-norm vector consumed by run_collect_all_multi.sh
 
 # --- Feature collection / mmap -- #
-FEATURE_MEMMAP="/mnt/eu/home/jmelko/curric/mgd/iter0/grads.mmap"         # destination memmap initialised by create_mmap_features.py
-CF_SHARDS_PER_GPU=2048                   # shards per GPU for collect_features
-CF_SHARD_SIZE=64
+: "${FEATURE_MEMMAP:=/mnt/eu/home/jmelko/curric/mgd/iter2_fix/grads.mmap}"         # destination memmap initialised by create_mmap_features.py
+: "${CF_SHARDS_PER_GPU:=2048}"                   # shards per GPU for collect_features
+: "${CF_SHARD_SIZE:=64}"
 
 # -------- Cosine-similarity eval ---- #
-ITER=0                               # iteration index forwarded to collect_cosine_sim_multi.py
-OUT_DIR="/mnt/eu/home/jmelko/curric/mgd/iter0"            # base directory where similarity results will be written
-MAX_ITEMS=64                        # maximum number of batches processed per dataset
-HESSIAN_DTYPE="fp16"                # storage dtype of the gradient memmap
-CLIP_PERCENTILE=99.9                # clipping threshold percentile
-COND_DTYPE="fp32"                  # output dtype for condition.py
+: "${ITER:=2}"                               # iteration index forwarded to collect_cosine_sim_multi.py
+: "${OUT_DIR:=/mnt/eu/home/jmelko/curric/mgd/iter2_fix}"            # base directory where similarity results will be written
+: "${MAX_ITEMS:=64}"                        # maximum number of batches processed per dataset
+: "${HESSIAN_DTYPE:=fp16}"                # storage dtype of the gradient memmap
+: "${CLIP_PERCENTILE:=99.9}"                # clipping threshold percentile
+: "${COND_DTYPE:=fp32}"                  # output dtype for condition.py
+# -------- Post-processing (step 6) ---- #
+: "${COUNTS_JSON:=/mnt/eu/home/jmelko/curric/mgd/iter1/updated_counts_iter1.json}"                     # REQUIRED: path to current cluster counts JSON used to build the dataset
+: "${STEP6_SCORES_DIR:=}"               # Optional: override scores dir; if empty, auto-detect under OUT_DIR
+: "${UPDATE_LR:=0.1}"                     # Learning rate for update_logits.py
+: "${UPDATE_MAX_Z:=5}"                     # Maximum z-score for update_logits.py
 ##################################
 #  ⁕  USER  CONFIGURATION END   ⁕  
 ##################################
@@ -218,19 +223,36 @@ echo "[workflow] Stage 5 complete – cosine similarity collection finished."
 echo "[workflow] Post-processing – update_logits.py"
 
 # Require COUNTS_JSON (the current cluster counts JSON used to build the dataset)
-if [[ -z "${COUNTS_JSON:-}" ]]; then
-  echo "ERROR: Please export COUNTS_JSON=/path/to/current_counts.json before running." >&2
+if [[ -z "${COUNTS_JSON}" ]]; then
+  echo "ERROR: COUNTS_JSON is empty. Set it in the configuration block at the top of this script." >&2
+  exit 1
+fi
+if [[ ! -f "${COUNTS_JSON}" ]]; then
+  echo "ERROR: COUNTS_JSON file not found: ${COUNTS_JSON}" >&2
   exit 1
 fi
 
-# Locate the scores directory produced in Stage 5 (expects dataset{i}.npz with 'dot' and 'l2')
-SCORES_DIR="$(dirname "$(find "${OUT_DIR}" -type f -name 'dataset0.npz' -print -quit)")"
-if [[ -z "${SCORES_DIR}" ]]; then
-  SCORES_DIR="$(dirname "$(find "${OUT_DIR}" -type f -name 'dataset*.npz' -print -quit)")"
-fi
-if [[ -z "${SCORES_DIR}" ]]; then
-  echo "ERROR: Could not locate 'dataset*.npz' under ${OUT_DIR}." >&2
-  exit 1
+# Determine scores directory: allow override or auto-detect under OUT_DIR
+if [[ -n "${STEP6_SCORES_DIR}" ]]; then
+  SCORES_DIR="${STEP6_SCORES_DIR}"
+  if [[ ! -d "${SCORES_DIR}" ]]; then
+    echo "ERROR: STEP6_SCORES_DIR does not exist or is not a directory: ${SCORES_DIR}" >&2
+    exit 1
+  fi
+  if ! find "${SCORES_DIR}" -maxdepth 1 -type f -name 'dataset*.npz' | grep -q .; then
+    echo "ERROR: No 'dataset*.npz' files found in STEP6_SCORES_DIR: ${SCORES_DIR}" >&2
+    exit 1
+  fi
+else
+  # Locate the scores directory produced in Stage 5 (expects dataset{i}.npz with 'dot' and 'l2')
+  SCORES_DIR="$(dirname "$(find "${OUT_DIR}" -type f -name 'dataset0.npz' -print -quit)")"
+  if [[ -z "${SCORES_DIR}" ]]; then
+    SCORES_DIR="$(dirname "$(find "${OUT_DIR}" -type f -name 'dataset*.npz' -print -quit)")"
+  fi
+  if [[ -z "${SCORES_DIR}" ]]; then
+    echo "ERROR: Could not locate 'dataset*.npz' under ${OUT_DIR}. Set STEP6_SCORES_DIR to override." >&2
+    exit 1
+  fi
 fi
 
 UPDATED_COUNTS="${OUT_DIR}/updated_counts_iter${ITER}.json"
@@ -240,8 +262,8 @@ python "${PROJECT_DIR}/update_logits.py" \
   --counts "${COUNTS_JSON}" \
   --scores-dir "${SCORES_DIR}" \
   --out-path "${UPDATED_COUNTS}" \
-  --lr 0.2 \
-  --max-z 5 \
+  --lr "${UPDATE_LR}" \
+  --max-z "${UPDATE_MAX_Z}" \
   --means-out "${MEANS_OUT}"
 
 echo "[workflow] Post-processing complete – updated counts saved to ${UPDATED_COUNTS}"
