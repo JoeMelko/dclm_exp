@@ -168,7 +168,7 @@ def make_regularizer(reg_type: str):
 
 def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Tensor,
                      target: np.ndarray, k_return: int = 1, error_log_path: str = "", chunk_size: int = 512,
-                     debug_log_path: str = "",
+                     debug_log_path: str = "", addition_log_path: str = "",
                      reg_type: str = "none", reg_lambda: float = 0.0,
                      l2norms: torch.Tensor | None = None, total_l2_sum: float | None = None,
                      bucket_ids: torch.Tensor | None = None, total_bucket_counts: torch.Tensor | None = None,
@@ -204,6 +204,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
 
     log_fh = open(error_log_path, "w") if error_log_path else None
     debug_fh = open(debug_log_path, "w") if debug_log_path else None
+    additions_fh = open(addition_log_path, "w") if addition_log_path else None
     _debug_every = 10000
 
     # --- regularization setup ---
@@ -270,13 +271,16 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
 
     while len(order) < total_steps:
         tokens_after_step = (len(order) + 1) * seq_len_const
+        # Expected addition this step based on ratios/schedule
         if not has_sched:
+            desired_add_step = target_t * float(seq_len_const)
             desired_next_total = target_t * tokens_after_step
         else:
             N_curr = float(offset_tokens + tokens_after_step)
             p_curr = _p_at(N_curr)
             dN = float(seq_len_const)
-            E_curr = E_prev + 0.5 * (p_prev + p_curr) * dN
+            desired_add_step = 0.5 * (p_prev + p_curr) * dN
+            E_curr = E_prev + desired_add_step
             desired_next_total = E_curr
             E_prev = E_curr
             p_prev = p_curr
@@ -373,6 +377,13 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
                 "cum_l2": float(errs[chosen].item()),
                 "reg_error": reg_error,
                 "err_total": float(errs_total[chosen].item())
+            }) + "\n")
+
+        # --- target addition logging (sampled every 1,000 steps) ---
+        if additions_fh is not None and (len(order) % 1000 == 0):
+            import json as _json
+            additions_fh.write(_json.dumps({
+                str(len(order)): desired_add_step.to(dtype=torch.float32).tolist()
             }) + "\n")
 
         pbar.update(1)
@@ -517,6 +528,8 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
         debug_fh.close()
     if log_fh is not None:
         log_fh.close()
+    if additions_fh is not None:
+        additions_fh.close()
     return order
 
 
@@ -872,6 +885,7 @@ def main():
 
     error_log_path = str(out_dir / "error_log.jsonl")
     debug_log_path = str(out_dir / "debug.json")
+    addition_log_path = str(out_dir / "target_additions.jsonl")
 
     # Determine optional step budget from --total-tokens argument
     seq_len_const = int(counts_all_cpu[0].sum().item())
@@ -891,6 +905,7 @@ def main():
         error_log_path=error_log_path,
         chunk_size=args.chunk_size,
         debug_log_path=debug_log_path,
+        addition_log_path=addition_log_path,
         reg_type=args.reg_type,
         reg_lambda=args.reg_lambda,
         l2norms=l2norms,
