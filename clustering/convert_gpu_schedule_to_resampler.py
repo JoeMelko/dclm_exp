@@ -184,6 +184,7 @@ def compute_resampler_schedule(
     ratios0: np.ndarray,
     total_tokens: float,
     chunks: int,
+    ratio_scale: float = 1.0,
     eps: float = 1e-12,
 ) -> Dict[str, List[float]]:
     """Compute r[i,t] = alpha[i,t] / (chunks * ratios0[i]) and return as dict of lists.
@@ -226,6 +227,8 @@ def compute_resampler_schedule(
     # For others, divide by (T * ratios0)
     safe_denom = np.where(zero_mask, 1.0, denom)
     r = np.where(zero_mask, 0.0, alpha / (T * safe_denom))
+    # Apply constant scaling to all output ratios
+    r = r * float(ratio_scale)
 
     # Emit as dict of lists for line_ratio_resampler_curric.py
     out: Dict[str, List[float]] = {}
@@ -242,6 +245,7 @@ def main(argv: List[str] | None = None):
     ap.add_argument("--chunks", type=int, required=True, help="Number of chunks T")
     ap.add_argument("--out", type=Path, required=True, help="Output JSON path for resampler schedule")
     ap.add_argument("--eps", type=float, default=1e-12, help="Small epsilon for stability when dividing by ratios0")
+    ap.add_argument("--ratio-scale", type=float, default=1.0, help="Multiply all output ratios by this constant")
     ap.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
     args = ap.parse_args(argv)
 
@@ -257,7 +261,15 @@ def main(argv: List[str] | None = None):
     if len(cols) != P.shape[1]:
         raise AssertionError("Column mismatch")
 
-    schedule = compute_resampler_schedule(knots, P, ratios0, float(args.total_toks), int(args.chunks), float(args.eps))
+    schedule = compute_resampler_schedule(
+        knots,
+        P,
+        ratios0,
+        float(args.total_toks),
+        int(args.chunks),
+        float(args.ratio_scale),
+        float(args.eps),
+    )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as f:
