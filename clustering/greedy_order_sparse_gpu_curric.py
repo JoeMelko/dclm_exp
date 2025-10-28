@@ -1,32 +1,37 @@
 #!/usr/bin/env python3
 """
-greedy_order_sparse_gpu.py
-==========================
+greedy_order_sparse_gpu_curric.py
+=================================
 
-GPU-sparse greedy ordering for large sequence × cluster problems.
+GPU-sparse greedy ordering for large sequence × cluster problems with a
+time-varying target schedule (curriculum) provided via --ratio-file. The
+schedule is defined as piecewise ratios at token "knots" and is interpolated
+in log-token space. The final row of the schedule is the end target.
 
-This mirrors the CPU implementation in greedy_order_sparse.py but moves the
-hot path and state to CUDA:
+This mirrors the CPU implementation but moves the hot path and state to CUDA:
  - counts_sparse: CSR on CUDA for fast SpMV per iteration
  - counts_all (dense): kept on CUDA for quick cumulative updates; CPU copy is
    also kept for output writing
- - regularizers: implemented with CUDA tensors; W2 helpers use small CPU paths
+ - regularizers: implemented with CUDA tensors (incl. doc-size token schedule)
 
 Dependencies
 ------------
 `pip install torch numpy tqdm webdataset`
 
-Usage (example)
----------------
-  python greedy_order_sparse_gpu.py \
+Usage (time-varying curricula + doc-size regularizer)
+----------------------------------------------------
+  python greedy_order_sparse_gpu_curric.py \
     --input-dir /path/to/tokenized_shards \
-    --ratio-file cluster_ratios.json \
+    --ratio-file /path/to/schedule.json \
     --out-dir /path/to/ordered_tokens \
     --shard-size 8192 \
-    --reg-type l2sum_schedule \
-    --reg-lambda 0.1
-Note: --ratio-file must be a dict-of-knots JSON where each per-knot dict uses keys dataset{i} with i=0..n_cluster-1 (strict).
-You can use --offset to start the schedule at an absolute token position when a schedule is provided.
+    --reg-type docsize_token_schedule \
+    --doc-bins 10 \
+    --reg-lambda 0.1 \
+    --offset 0
+Note: --ratio-file must be a dict-of-knots JSON where each per-knot dict uses
+keys dataset{i} with i=0..n_cluster-1 (strict). You can use --offset to start
+the schedule at an absolute token position.
 """
 
 from __future__ import annotations
@@ -177,6 +182,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
                      doc_total_tokens_per_bin: torch.Tensor | None = None,
                      doc_n_bins: int | None = None,
                      doc_row_norm2: torch.Tensor | None = None,
+                     doc_cluster_bin_prob: torch.Tensor | None = None,
                      sched_P: torch.Tensor | None = None, sched_knots: torch.Tensor | None = None,
                      sched_U: torch.Tensor | None = None, sched_inv_du: torch.Tensor | None = None,
                      offset_tokens: int = 0,
@@ -232,9 +238,12 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
         elif reg_type == "docsize_token_schedule":
             if doc_hist_per_seq is None or doc_total_tokens_per_bin is None or doc_n_bins is None or doc_row_norm2 is None:
                 raise ValueError("docsize_token_schedule requires doc_hist_per_seq, doc_total_tokens_per_bin, doc_n_bins, doc_row_norm2")
+            if doc_cluster_bin_prob is None:
+                raise ValueError("docsize_token_schedule requires doc_cluster_bin_prob")
             doc_hist_per_seq = doc_hist_per_seq.to(device=device, dtype=torch.float32)
             doc_total_tokens_per_bin = doc_total_tokens_per_bin.to(device=device, dtype=torch.float32)
             doc_row_norm2 = doc_row_norm2.to(device=device, dtype=torch.float32)
+            doc_cluster_bin_prob = doc_cluster_bin_prob.to(device=device, dtype=torch.float32)
             cum_doc_tokens_per_bin = torch.zeros(doc_n_bins, dtype=torch.int32, device=device)
         else:
             pass
@@ -317,7 +326,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
                 reg_vec = bucket_w2_costs2.clamp_min(0).sqrt()[bucket_ids]
                 errs_total = errs + (reg_lambda * reg_vec)
             elif reg_type == "docsize_token_schedule":
-                expected_next_tokens_per_bin = doc_total_tokens_per_bin * ((len(order) + 1) / n_total)
+                expected_next_tokens_per_bin = doc_cluster_bin_prob.t().matmul(desired_next_total)
                 delta_tokens = cum_doc_tokens_per_bin.float() - expected_next_tokens_per_bin
                 base_const = (delta_tokens * delta_tokens).sum()
                 # Dense matmul: (N,B) @ (B,) -> (N,)
@@ -426,7 +435,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
                     reg_expected = (total_bucket_counts * (len(order) / n_total)).to(dtype=torch.float32).tolist()  # type: ignore[union-attr]
                 elif reg_type == "docsize_token_schedule" and 'cum_doc_tokens_per_bin' in locals():
                     reg_actual = cum_doc_tokens_per_bin.tolist()
-                    reg_expected = (doc_total_tokens_per_bin * (len(order) / n_total)).to(dtype=torch.float32).tolist()  # type: ignore[operator]
+                    reg_expected = (doc_cluster_bin_prob.t().matmul(desired_next_total)).to(dtype=torch.float32).tolist()  # type: ignore[operator]
             import json as _json
             debug_fh.write(_json.dumps({
                 "step": len(order),
@@ -476,7 +485,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
                     chunk_indices = order[-chunk_size:]
                     idx_t = torch.tensor(chunk_indices, device=device, dtype=torch.long)
                     chunk_token_hist = doc_hist_per_seq.index_select(0, idx_t).sum(dim=0)
-                    expected_chunk_tokens_per_bin = doc_total_tokens_per_bin * (chunk_size / n_total)
+                    expected_chunk_tokens_per_bin = doc_cluster_bin_prob.t().matmul(expected_chunk_counts)
                     delta_chunk = chunk_token_hist - expected_chunk_tokens_per_bin
                     chunk_reg_error = float(torch.norm(delta_chunk, p=2).item())
             import json as _json
@@ -514,7 +523,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
                 reg_expected = total_bucket_counts.to(dtype=torch.float32).tolist()  # type: ignore[union-attr]
             elif reg_type == "docsize_token_schedule" and 'cum_doc_tokens_per_bin' in locals():
                 reg_actual = cum_doc_tokens_per_bin.tolist()
-                reg_expected = doc_total_tokens_per_bin.to(dtype=torch.float32).tolist()  # type: ignore[union-attr]
+                reg_expected = (doc_cluster_bin_prob.t().matmul(E_prev)).to(dtype=torch.float32).tolist()  # type: ignore[operator]
         import json as _json
         debug_fh.write(_json.dumps({
             "step": n_total,
@@ -827,6 +836,7 @@ def main():
     doc_total_tokens_per_bin = None
     doc_n_bins = None
     doc_row_norm2 = None
+    doc_cluster_bin_prob = None
     if args.reg_type == 'docsize_token_schedule':
         B = int(args.doc_bins)
         crow = counts_sparse_gpu.crow_indices()
@@ -875,6 +885,17 @@ def main():
         doc_total_tokens_per_bin = doc_hist_per_seq.sum(dim=0)
         doc_row_norm2 = (doc_hist_per_seq * doc_hist_per_seq).sum(dim=1)
 
+        # Build (C, B) doc_cluster_bin_tokens via aggregation over (cluster, bin)
+        C = int(counts_sparse_gpu.size(1))
+        col_ids = counts_sparse_gpu.col_indices()
+        cluster_bin_flat = torch.zeros(C * B, dtype=torch.float32, device=vals.device)
+        flat_cb_indices = col_ids * B + entry_bin_ids
+        cluster_bin_flat.index_add_(0, flat_cb_indices, vals.to(dtype=torch.float32))
+        doc_cluster_bin_tokens = cluster_bin_flat.view(C, B)
+        # Row-normalize to probabilities
+        row_sums = doc_cluster_bin_tokens.sum(dim=1, keepdim=True)
+        doc_cluster_bin_prob = doc_cluster_bin_tokens / (row_sums + 1e-12)
+
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -918,6 +939,7 @@ def main():
         doc_total_tokens_per_bin=doc_total_tokens_per_bin,
         doc_n_bins=doc_n_bins,
         doc_row_norm2=doc_row_norm2,
+        doc_cluster_bin_prob=doc_cluster_bin_prob,
         sched_P=sched_P_t,
         sched_knots=sched_knots_t,
         sched_U=sched_U_t,
