@@ -174,6 +174,7 @@ def make_regularizer(reg_type: str):
 def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Tensor,
                      target: np.ndarray, k_return: int = 1, error_log_path: str = "", chunk_size: int = 512,
                      debug_log_path: str = "", addition_log_path: str = "",
+                     doc_addition_log_path: str = "",
                      reg_type: str = "none", reg_lambda: float = 0.0,
                      l2norms: torch.Tensor | None = None, total_l2_sum: float | None = None,
                      bucket_ids: torch.Tensor | None = None, total_bucket_counts: torch.Tensor | None = None,
@@ -211,6 +212,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
     log_fh = open(error_log_path, "w") if error_log_path else None
     debug_fh = open(debug_log_path, "w") if debug_log_path else None
     additions_fh = open(addition_log_path, "w") if addition_log_path else None
+    doc_additions_fh = open(doc_addition_log_path, "w") if doc_addition_log_path else None
     _debug_every = 10000
 
     # --- regularization setup ---
@@ -395,6 +397,21 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
                 str(len(order)): desired_add_step.to(dtype=torch.float32).tolist()
             }) + "\n")
 
+        # --- docsize target addition logging (every _debug_every steps) ---
+        if (
+            doc_additions_fh is not None
+            and len(order) > 0
+            and (len(order) % _debug_every == 0)
+            and use_reg
+            and reg_type == "docsize_token_schedule"
+            and 'doc_cluster_bin_prob' in locals()
+        ):
+            import json as _json
+            doc_add_step = doc_cluster_bin_prob.t().matmul(desired_add_step)
+            doc_additions_fh.write(_json.dumps({
+                str(len(order)): doc_add_step.to(dtype=torch.float32).tolist()
+            }) + "\n")
+
         pbar.update(1)
 
         # --- periodic debug logging every 10,000 sequences ---
@@ -539,6 +556,8 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
         log_fh.close()
     if additions_fh is not None:
         additions_fh.close()
+    if doc_additions_fh is not None:
+        doc_additions_fh.close()
     return order
 
 
@@ -640,15 +659,15 @@ def main():
                     help='Prefetch batches per worker (WebLoader)')
     ap.add_argument('--chunk-size', type=int, default=512,
                     help='Chunk size for per-chunk L2 logging (sequences)')
-    ap.add_argument('--reg-type', type=str, default='none', choices=['none', 'l2sum_schedule', 'histogram_schedule', 'w2_histogram_schedule', 'docsize_token_schedule'],
+    ap.add_argument('--reg-type', type=str, default='docsize_token_schedule', choices=['none', 'l2sum_schedule', 'histogram_schedule', 'w2_histogram_schedule', 'docsize_token_schedule'],
                     help='Regularization strategy to apply during selection')
-    ap.add_argument('--reg-lambda', type=float, default=0.0,
+    ap.add_argument('--reg-lambda', type=float, default=1.0,
                     help='Weight applied to the regularization term (0.0 disables)')
     ap.add_argument('--n-buckets', type=int, default=10,
                     help='Number of buckets for histogram_schedule regularizer')
     ap.add_argument('--bucket-method', type=str, default='quantile', choices=['uniform', 'quantile'],
                     help='Bucketization method for histogram_schedule regularizer')
-    ap.add_argument('--doc-bins', type=int, default=10,
+    ap.add_argument('--doc-bins', type=int, default=100,
                     help='Number of size bins for docsize_token_schedule (token-weighted quantiles)')
     ap.add_argument('--rand', action='store_true', help='Choose sequences uniformly at random instead of greedy error minimization')
     ap.add_argument('--dtype', type=str, default='fp32', choices=['fp32', 'fp16', 'bf16'],
@@ -907,6 +926,7 @@ def main():
     error_log_path = str(out_dir / "error_log.jsonl")
     debug_log_path = str(out_dir / "debug.json")
     addition_log_path = str(out_dir / "target_additions.jsonl")
+    doc_addition_log_path = str(out_dir / "docsize_additions.jsonl")
 
     # Determine optional step budget from --total-tokens argument
     seq_len_const = int(counts_all_cpu[0].sum().item())
@@ -927,6 +947,7 @@ def main():
         chunk_size=args.chunk_size,
         debug_log_path=debug_log_path,
         addition_log_path=addition_log_path,
+        doc_addition_log_path=doc_addition_log_path,
         reg_type=args.reg_type,
         reg_lambda=args.reg_lambda,
         l2norms=l2norms,
