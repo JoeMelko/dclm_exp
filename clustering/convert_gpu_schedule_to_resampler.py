@@ -7,11 +7,14 @@ Convert a GPU-style dict-of-knots token-ratio schedule into the per-dataset
 per-chunk keep ratios expected by line_ratio_resampler_curric.py (schedule mode),
 with intentional drift allowed across clusters.
 
-Semantics
-- Interpolates the knot schedule linearly in log-token space (matching the
-  greedy GPU script semantics).
-- Integrates expected tokens per dataset over equal-token chunks to get per-chunk
-  average token shares alpha[i, t].
+This implementation:
+- Interpolates *log-probabilities* linearly in *log-token* space between knots,
+  then renormalizes via softmax at every evaluation point.
+- Integrates expected tokens per dataset over equal-token chunks using a
+  composite trapezoidal rule with a **fixed absolute step size** equal to
+  --seq-len (default: 2048 tokens), aligned to a global grid defined by
+  G(m) = --offset + m * --seq-len.
+  This mirrors the greedy GPU script’s per-sequence trapezoid step.
 - Emits r[i, t] = alpha[i, t] / (T * ratios0[i]) where T is --chunks and
   ratios0 is the baseline cluster mix. If ratios0[i] == 0, r[i, t] is set to 0.
 
@@ -22,13 +25,17 @@ Usage (module)
     --total-toks 500000000 \
     --chunks 16 \
     --out /path/to/resampler_schedule.json \
+    --seq-len 2048 \
+    --offset 0 \
     --pretty
 
 Inputs
-- --gpu-schedule: JSON dict of {"<knot_tokens>": {"dataset0": r0, ..., "dataset{C-1}": rC-1}}
+- --gpu-schedule: JSON dict {"<knot_tokens>": {"dataset0": r0, ..., "dataset{C-1}": rC-1}}
 - --ratios0: JSON dict baseline {"dataset0": p0, ..., "dataset{C-1}": pC-1} (will be normalized)
 - --total-toks: total tokens across all chunks (float/int)
 - --chunks: number of equal-token chunks T
+- --seq-len: integration step size in tokens (default 2048). Also the grid period.
+- --offset: absolute-token offset for the fixed step grid (default 0).
 
 Output
 - --out: JSON schedule {"dataset<i>": [r[i,0], ..., r[i,T-1]]} consumable by
@@ -42,7 +49,17 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
+# Optional progress bar
+try:
+    from tqdm import tqdm  # type: ignore
+except Exception:  # pragma: no cover - fallback when tqdm not available
+    def tqdm(iterable, **kwargs):  # type: ignore
+        return iterable
 
+
+# --------------------------------------------------------------------------- #
+# Loading                                                                     #
+# --------------------------------------------------------------------------- #
 def _load_gpu_knot_schedule(path: Path) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """Read the dict-of-knots GPU schedule and return (knots, P, dataset_cols).
 
@@ -110,87 +127,137 @@ def _load_baseline_ratios(path: Path, expected_cols: List[str]) -> np.ndarray:
     return ratios0.astype(np.float64)
 
 
-def _integrate_piece_linear_in_logN(Na: float, Nb: float, U0: float, U1: float, P0: np.ndarray, P1: np.ndarray) -> np.ndarray:
-    """Exact integral of p(N) over [Na,Nb] when p is linear in log N over [U0,U1].
+# --------------------------------------------------------------------------- #
+# Interpolation & Integration                                                 #
+# --------------------------------------------------------------------------- #
+def _normalize_row(row: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Normalize a nonnegative row to sum ~ 1 with epsilon guard."""
+    s = float(row.sum())
+    if not math.isfinite(s) or s <= eps:
+        C = row.shape[0]
+        return np.full((C,), 1.0 / max(C, 1), dtype=np.float64)
+    return (row / s).astype(np.float64)
 
-    p(u) = (1 - t) P0 + t P1,  t = (u - U0) / (U1 - U0).  We compute ∫ p(N) dN = ∫ p(u) e^u du.
-    Closed-form: If we let p(u) = a + b u, then ∫ (a + b u) e^u du = a e^u + b e^u (u - 1).
+
+def _p_at_N_logprob(N: float, knots: np.ndarray, P: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Instantaneous mix p(N) using log-prob interpolation in log-token space.
+
+    - If N <= first knot: return normalized P[0]
+    - If N >= last knot : return normalized P[-1]
+    - Else on interval [k_i, k_{i+1}]:
+        u = log N, U0 = log k_i, U1 = log k_{i+1}
+        l(u) = (1-t) * log P[i] + t * log P[i+1],  t = (u-U0)/(U1-U0)
+        p(N) = softmax(l(u))
     """
-    assert Na <= Nb
-    assert U0 < U1
-    du = (U1 - U0)
-    # a = P0 - ((P1 - P0) * U0) / du;  b = (P1 - P0) / du
-    diff = (P1 - P0)
-    b = diff / du
-    a = P0 - (b * U0)
-    ua = math.log(Na)
-    ub = math.log(Nb)
-    # Evaluate primitive at bounds
-    def F(u: float) -> np.ndarray:
-        eu = math.exp(u)
-        return a * eu + b * eu * (u - 1.0)
-    return F(ub) - F(ua)
+    if N <= knots[0]:
+        return _normalize_row(P[0].astype(np.float64), eps)
+    if N >= knots[-1]:
+        return _normalize_row(P[-1].astype(np.float64), eps)
+
+    # Find active interval
+    K = knots.shape[0]
+    i = int(np.searchsorted(knots, N, side="right") - 1)
+    i = max(0, min(i, K - 2))
+
+    U0 = math.log(float(knots[i]))
+    U1 = math.log(float(knots[i + 1]))
+    u = math.log(max(N, eps))
+    t = (u - U0) / max(U1 - U0, eps)
+
+    # Interpolate logits, then softmax
+    l0 = np.log(np.clip(P[i].astype(np.float64),     eps, None))
+    l1 = np.log(np.clip(P[i + 1].astype(np.float64), eps, None))
+    l  = (1.0 - t) * l0 + t * l1
+    m  = float(np.max(l))
+    ex = np.exp(l - m)
+    Z  = float(ex.sum())
+    if Z <= eps or not math.isfinite(Z):
+        return _normalize_row(P[i].astype(np.float64), eps)  # fallback
+    return (ex / Z).astype(np.float64)
 
 
-def _integrate_schedule_over_interval(Na: float, Nb: float, knots: np.ndarray, P: np.ndarray) -> np.ndarray:
-    """Integrate p(N) dN over [Na, Nb] using exact expressions with log-token linear interpolation.
+def _integrate_fixedstep_trapezoid(
+    Na: float,
+    Nb: float,
+    knots: np.ndarray,
+    P: np.ndarray,
+    seq_len: float,
+    offset: float = 0.0,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """Integrate ∫_{Na}^{Nb} p(N) dN using composite trapezoid with a fixed global step.
 
-    Handles clamping below the first knot and above the last knot (constant p).
-    Returns a vector of expected tokens per dataset for the interval.
+    - Step size h = seq_len (tokens)
+    - Grid is G(m) = offset + m*h (m integer)
+    - Intervals are [Na, first_grid), then full steps on aligned [g, g+h], then [last_grid, Nb)
+    - p(N) is evaluated via log-prob interpolation in log-token space.
     """
-    assert Na < Nb
-    # Below first knot: constant P[0]
-    total = np.zeros((P.shape[1],), dtype=np.float64)
-    if Nb <= knots[0]:
-        return (Nb - Na) * P[0].astype(np.float64)
-    if Na >= knots[-1]:
-        return (Nb - Na) * P[-1].astype(np.float64)
+    assert Nb > Na, "Empty interval"
+    h = float(seq_len)
+    if h <= 0.0 or not math.isfinite(h):
+        raise ValueError("seq_len must be positive and finite")
+    off = float(offset)
 
-    curr_a = Na
-    # Segment 1: up to first knot
-    if curr_a < knots[0]:
-        seg_b = min(Nb, float(knots[0]))
-        total += (seg_b - curr_a) * P[0].astype(np.float64)
-        curr_a = seg_b
-        if curr_a >= Nb:
-            return total
+    C = int(P.shape[1])
+    total = np.zeros((C,), dtype=np.float64)
 
-    # Middle segments between knots
-    for k in range(len(knots) - 1):
-        seg_left = float(knots[k])
-        seg_right = float(knots[k + 1])
-        if curr_a >= Nb:
-            break
-        if Nb <= seg_left or curr_a >= seg_right:
-            continue
-        a = max(curr_a, seg_left)
-        b = min(Nb, seg_right)
-        if a < b:
-            U0 = math.log(seg_left)
-            U1 = math.log(seg_right)
-            contrib = _integrate_piece_linear_in_logN(a, b, U0, U1, P[k].astype(np.float64), P[k + 1].astype(np.float64))
-            total += contrib
-            curr_a = b
+    # Helper: one trapezoid contribution on [a,b]
+    def trap(a: float, b: float) -> np.ndarray:
+        if b <= a:
+            return np.zeros((C,), dtype=np.float64)
+        pa = _p_at_N_logprob(a, knots, P, eps=eps)
+        pb = _p_at_N_logprob(b, knots, P, eps=eps)
+        return 0.5 * (pa + pb) * (b - a)
 
-    if curr_a < Nb:
-        # Tail after last knot: constant P[-1]
-        total += (Nb - curr_a) * P[-1].astype(np.float64)
+    # First grid boundary >= Na
+    m_start = math.ceil((Na - off) / h - 1e-12)
+    g0 = off + m_start * h
+
+    # Last grid boundary <= Nb
+    m_end = math.floor((Nb - off) / h + 1e-12)
+    g_last = off + m_end * h
+
+    # Initial partial segment
+    if g0 > Na:
+        total += trap(Na, min(Nb, g0))
+
+    # Full aligned steps
+    if g0 < Nb and m_end >= m_start:
+        iter_range = range(m_start, m_end)
+        total_steps = max(m_end - m_start, 0)
+        for m in tqdm(iter_range, total=total_steps, desc="Trapezoids", unit="step", leave=False):
+            a = off + m * h
+            b = a + h
+            if a >= Nb:
+                break
+            total += trap(max(a, Na), min(b, Nb))
+
+    # Tail partial segment
+    if g_last < Nb:
+        total += trap(max(g_last, Na), Nb)
+
     return total
 
 
+# --------------------------------------------------------------------------- #
+# Schedule computation                                                        #
+# --------------------------------------------------------------------------- #
 def compute_resampler_schedule(
     knots: np.ndarray,
     P: np.ndarray,
     ratios0: np.ndarray,
     total_tokens: float,
     chunks: int,
+    seq_len: int = 2048,
+    offset: float = 0.0,
     ratio_scale: float = 1.0,
     eps: float = 1e-12,
 ) -> Dict[str, List[float]]:
     """Compute r[i,t] = alpha[i,t] / (chunks * ratios0[i]) and return as dict of lists.
 
-    alpha[i,t] is the average token share for cluster i in chunk t, obtained by exact
-    integration of the knot schedule over the token interval for that chunk.
+    alpha[i,t] is the average token share for cluster i in chunk t, obtained by
+    fixed-step trapezoidal integration with step = seq_len, aligned to the
+    global grid offset + m*seq_len.
     """
     C = int(P.shape[1])
     T = int(chunks)
@@ -200,19 +267,23 @@ def compute_resampler_schedule(
     # Equal-token chunk boundaries
     boundaries = np.linspace(0.0, float(total_tokens), num=T + 1, dtype=np.float64)
     E = np.zeros((C, T), dtype=np.float64)
+
     for t in range(T):
+        print(f"Computing chunk {t} of {T}")
         Na = float(boundaries[t])
         Nb = float(boundaries[t + 1])
         if Nb <= Na:
             continue
-        # Integrate expected tokens per dataset over [Na, Nb]
-        integ = _integrate_schedule_over_interval(Na, Nb, knots, P)
+        integ = _integrate_fixedstep_trapezoid(
+            Na=Na, Nb=Nb, knots=knots, P=P, seq_len=float(seq_len), offset=float(offset), eps=eps
+        )
         E[:, t] = integ
 
     # Convert to shares per chunk
-    deltaN = (float(total_tokens) / T)
+    deltaN = float(total_tokens) / T
     alpha = E / max(deltaN, eps)
-    # Numerical safety: clamp small negatives and renormalize each chunk to sum ~1
+
+    # Numerical safety: clamp tiny negatives and renormalize each chunk to sum ~1
     alpha = np.clip(alpha, 0.0, None)
     col_sums = alpha.sum(axis=0, keepdims=True)
     nz = np.where(col_sums > 0.0, col_sums, 1.0)
@@ -220,13 +291,15 @@ def compute_resampler_schedule(
 
     # r[i,t] = alpha[i,t] / (T * ratios0[i])
     denom = ratios0.reshape(C, 1)
-    r = np.empty_like(alpha)
     zero_mask = denom <= eps
+
+    r = np.empty_like(alpha)
     # For datasets with zero baseline, force r=0 (treated as excluded)
     r[zero_mask[:, 0], :] = 0.0
     # For others, divide by (T * ratios0)
     safe_denom = np.where(zero_mask, 1.0, denom)
     r = np.where(zero_mask, 0.0, alpha / (T * safe_denom))
+
     # Apply constant scaling to all output ratios
     r = r * float(ratio_scale)
 
@@ -237,16 +310,33 @@ def compute_resampler_schedule(
     return out
 
 
+# --------------------------------------------------------------------------- #
+# CLI                                                                         #
+# --------------------------------------------------------------------------- #
 def main(argv: List[str] | None = None):
-    ap = argparse.ArgumentParser(description="Convert GPU knot schedule to resampler per-chunk keep ratios (with drift)")
-    ap.add_argument("--gpu-schedule", type=Path, required=True, help="Path to dict-of-knots JSON schedule for greedy GPU script")
-    ap.add_argument("--ratios0", type=Path, required=True, help="Path to baseline ratios JSON {dataset{i}: ratio}")
-    ap.add_argument("--total-toks", type=float, required=True, help="Total tokens across all chunks")
-    ap.add_argument("--chunks", type=int, required=True, help="Number of chunks T")
-    ap.add_argument("--out", type=Path, required=True, help="Output JSON path for resampler schedule")
-    ap.add_argument("--eps", type=float, default=1e-12, help="Small epsilon for stability when dividing by ratios0")
-    ap.add_argument("--ratio-scale", type=float, default=1.0, help="Multiply all output ratios by this constant")
-    ap.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
+    ap = argparse.ArgumentParser(
+        description="Convert GPU knot schedule to resampler per-chunk keep ratios (with drift)"
+    )
+    ap.add_argument("--gpu-schedule", type=Path, required=True,
+                    help="Path to dict-of-knots JSON schedule for greedy GPU script")
+    ap.add_argument("--ratios0", type=Path, required=True,
+                    help="Path to baseline ratios JSON {dataset{i}: ratio}")
+    ap.add_argument("--total-toks", type=float, required=True,
+                    help="Total tokens across all chunks")
+    ap.add_argument("--chunks", type=int, required=True,
+                    help="Number of chunks T")
+    ap.add_argument("--seq-len", type=int, default=2048,
+                    help="Fixed integration step size (tokens). Default: 2048")
+    ap.add_argument("--offset", type=float, default=0.0,
+                    help="Absolute-token offset for the step grid (default 0)")
+    ap.add_argument("--out", type=Path, required=True,
+                    help="Output JSON path for resampler schedule")
+    ap.add_argument("--eps", type=float, default=1e-12,
+                    help="Small epsilon for stability (clamps, divisions)")
+    ap.add_argument("--ratio-scale", type=float, default=1.0,
+                    help="Multiply all output ratios by this constant")
+    ap.add_argument("--pretty", action="store_true",
+                    help="Pretty-print JSON output")
     args = ap.parse_args(argv)
 
     # Expand ~ and ensure .json extension for out if missing
@@ -262,13 +352,15 @@ def main(argv: List[str] | None = None):
         raise AssertionError("Column mismatch")
 
     schedule = compute_resampler_schedule(
-        knots,
-        P,
-        ratios0,
-        float(args.total_toks),
-        int(args.chunks),
-        float(args.ratio_scale),
-        float(args.eps),
+        knots=knots,
+        P=P,
+        ratios0=ratios0,
+        total_tokens=float(args.total_toks),
+        chunks=int(args.chunks),
+        seq_len=int(args.seq_len),
+        offset=float(args.offset),
+        ratio_scale=float(args.ratio_scale),
+        eps=float(args.eps),
     )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -283,5 +375,3 @@ def main(argv: List[str] | None = None):
 
 if __name__ == "__main__":
     main()
-
-

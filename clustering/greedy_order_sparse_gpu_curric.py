@@ -276,7 +276,8 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
         # Interpolate linearly in log-tokens within [k_idx, k_idx+1]
         u_curr = torch.log(torch.tensor(N_tokens, dtype=torch.float32, device=device))
         t = (u_curr - sched_U[k_idx]) * sched_inv_du[k_idx]  # type: ignore[index]
-        return (1.0 - t) * sched_P[k_idx] + t * sched_P[k_idx + 1]  # type: ignore[index]
+        p_log_interp = (1.0 - t) * torch.log(sched_P[k_idx]) + t * torch.log(sched_P[k_idx + 1])  # type: ignore[index]
+        return torch.softmax(p_log_interp, dim=0)
 
     p_prev = _p_at(float(offset_tokens)) if has_sched else target_t
 
