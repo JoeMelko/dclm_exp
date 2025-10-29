@@ -23,6 +23,10 @@ COUNTS_JSONS=(
   /mnt/eu/home/jmelko/curric/counts_subset0.json
 )
 
+# Optional per-run global shard reader offsets (one per UUID). If left empty,
+# a default of 0 will be used for all runs.
+CF_GLOBAL_SHARD_OFFSETS=()
+
 # Optional overrides (leave empty to use defaults in run_full_workflow.sh)
 DATA_PARENT_DIR="/mnt/eu/home/jmelko/curric/400m_tok"
 WDS_DIR="/mnt/eu/home/jmelko/curric/baseline0_chunked/ready_to_train"
@@ -55,6 +59,15 @@ for p in "${COUNTS_JSONS[@]}"; do
   fi
 done
 
+# If CF_GLOBAL_SHARD_OFFSETS not provided, default to zeros matching UUID count.
+if [[ ${#CF_GLOBAL_SHARD_OFFSETS[@]} -eq 0 ]]; then
+  for _ in "${UUIDS[@]}"; do CF_GLOBAL_SHARD_OFFSETS+=(0); done
+fi
+# Validate optional offsets length if provided
+if [[ ${#UUIDS[@]} -ne ${#CF_GLOBAL_SHARD_OFFSETS[@]} ]]; then
+  echo "UUIDS and CF_GLOBAL_SHARD_OFFSETS must have the same length" >&2; exit 1
+fi
+
 for i in "${!UUIDS[@]}"; do
   UUID="${UUIDS[$i]}"
   TAG="${TAGS[$i]}"
@@ -70,6 +83,7 @@ for i in "${!UUIDS[@]}"; do
   WHITENED_TARGET="${RUN_DIR}/hw_target.npy" \
   ITER="${ITER}" \
   COUNTS_JSON="${COUNTS_JSONS[$i]}" \
+  CF_GLOBAL_SHARD_OFFSET="${CF_GLOBAL_SHARD_OFFSETS[$i]}" \
   DATA_PARENT_DIR="${DATA_PARENT_DIR}" \
   WDS_DIR="${WDS_DIR}" \
   OH_DIR="${OH_DIR}" \

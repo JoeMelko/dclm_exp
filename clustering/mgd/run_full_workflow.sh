@@ -59,6 +59,7 @@ PROJECT_DIR="$(dirname "$(realpath "$0")")"   # this script lives in clustering/
 : "${FEATURE_MEMMAP:=/mnt/eu/home/jmelko/curric/mgd/iter2_fix/grads.mmap}"         # destination memmap initialised by create_mmap_features.py
 : "${CF_SHARDS_PER_GPU:=2048}"                   # shards per GPU for collect_features
 : "${CF_SHARD_SIZE:=64}"
+: "${CF_GLOBAL_SHARD_OFFSET:=0}"                 # global reader offset applied before per-GPU slicing
 
 # -------- Cosine-similarity eval ---- #
 : "${ITER:=2}"                               # iteration index forwarded to collect_cosine_sim_multi.py
@@ -107,6 +108,7 @@ echo "[workflow] Stage 1/5 – launch_collect_features.sh"
     --wds-dir "${WDS_DIR}" \
     --shards-per-gpu "${CF_SHARDS_PER_GPU}" \
     --shard-size "${CF_SHARD_SIZE}" \
+    --global-shard-offset "${CF_GLOBAL_SHARD_OFFSET}" \
     --out "${FEATURE_MEMMAP}" \
     --lora-rank "${LORA_RANK}" \
     --num-blocks "${NUM_BLOCKS}" \

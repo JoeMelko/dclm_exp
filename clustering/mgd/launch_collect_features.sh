@@ -31,6 +31,7 @@ SHARD_SIZE=1000        # samples per shard (placeholder default)
 TOTAL_SHARDS=$((GPU_COUNT*SHARDS_PER_GPU))
 EXTRA_ARGS=()
 CUSTOM_TOTAL_SHARDS=0
+GLOBAL_SHARD_OFFSET=0  # optional global reader offset
 
 # ------------- CLI parsing -------------------- #
 while [[ $# -gt 0 ]]; do
@@ -41,6 +42,8 @@ while [[ $# -gt 0 ]]; do
             SHARD_SIZE="$2"; shift 2;;
         --num-shards)
             TOTAL_SHARDS="$2"; CUSTOM_TOTAL_SHARDS=1; shift 2;;
+        --global-shard-offset)
+            GLOBAL_SHARD_OFFSET="$2"; shift 2;;
         *)
             EXTRA_ARGS+=("$1"); shift;;
     esac
@@ -69,6 +72,7 @@ for GPU_ID in $(seq 0 $((GPU_COUNT-1))); do
         --gpu-id "$GPU_ID" \
         --total-gpus "$GPU_COUNT" \
         --chunk-size "$SHARDS_PER_GPU" \
+        --global-shard-offset "$GLOBAL_SHARD_OFFSET" \
         --num-shards "$TOTAL_SHARDS" \
         --shard-size "$SHARD_SIZE" \
         --start-offset "$START_OFFSET" \
