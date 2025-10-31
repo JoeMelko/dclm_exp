@@ -201,11 +201,11 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
     # Precompute per-sequence norms on device if not provided
     norms2 = (counts_all_gpu * counts_all_gpu).sum(dim=1)
 
-    cum_counts = torch.zeros(n_cluster, dtype=torch.float32, device=device)
+    cum_counts = torch.zeros(n_cluster, dtype=torch.float64, device=device)
     used_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
     order: list[int] = []
 
-    chunk_counts = torch.zeros(n_cluster, dtype=torch.float32, device=device)
+    chunk_counts = torch.zeros(n_cluster, dtype=torch.float64, device=device)
 
     pbar = tqdm(total=total_steps, desc="Ordering sequences (GPU-sparse)")
 
@@ -254,7 +254,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
 
     # --- schedule setup (optional) ---
     has_sched = (sched_P is not None)
-    E_prev = torch.zeros(n_cluster, dtype=torch.float32, device=device)
+    E_prev = torch.zeros(n_cluster, dtype=torch.float64, device=device)
     E_chunk_start = E_prev.clone()
     k_idx: int = 0  # active knot interval index
 
@@ -292,11 +292,11 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
             p_curr = _p_at(N_curr)
             dN = float(seq_len_const)
             desired_add_step = 0.5 * (p_prev + p_curr) * dN
-            E_curr = E_prev + desired_add_step
+            E_curr = E_prev + desired_add_step.to(dtype=E_prev.dtype)
             desired_next_total = E_curr
             E_prev = E_curr
             p_prev = p_curr
-        residual_for_choice = desired_next_total - cum_counts
+        residual_for_choice = (desired_next_total - cum_counts).to(dtype=counts_all_gpu.dtype)
         residual_norm2 = (residual_for_choice * residual_for_choice).sum()
 
         # Match dtype for sparse.mm when counts are fp16/bf16/fp32
@@ -329,7 +329,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
                 reg_vec = bucket_w2_costs2.clamp_min(0).sqrt()[bucket_ids]
                 errs_total = errs + (reg_lambda * reg_vec)
             elif reg_type == "docsize_token_schedule":
-                expected_next_tokens_per_bin = doc_cluster_bin_prob.t().matmul(desired_next_total)
+                expected_next_tokens_per_bin = doc_cluster_bin_prob.t().matmul(desired_next_total.to(dtype=counts_all_gpu.dtype))
                 delta_tokens = cum_doc_tokens_per_bin.float() - expected_next_tokens_per_bin
                 base_const = (delta_tokens * delta_tokens).sum()
                 # Dense matmul: (N,B) @ (B,) -> (N,)
@@ -362,8 +362,8 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
 
         # Update state
         used_mask[chosen] = True
-        cum_counts += counts_all_gpu[chosen]
-        chunk_counts += counts_all_gpu[chosen]
+        cum_counts += counts_all_gpu[chosen].to(dtype=cum_counts.dtype)
+        chunk_counts += counts_all_gpu[chosen].to(dtype=chunk_counts.dtype)
         order.append(chosen)
         if use_reg:
             if reg_type == "l2sum_schedule":
@@ -453,7 +453,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
                     reg_expected = (total_bucket_counts * (len(order) / n_total)).to(dtype=torch.float32).tolist()  # type: ignore[union-attr]
                 elif reg_type == "docsize_token_schedule" and 'cum_doc_tokens_per_bin' in locals():
                     reg_actual = cum_doc_tokens_per_bin.tolist()
-                    reg_expected = (doc_cluster_bin_prob.t().matmul(desired_next_total)).to(dtype=torch.float32).tolist()  # type: ignore[operator]
+                    reg_expected = (doc_cluster_bin_prob.t().matmul(desired_next_total.to(dtype=counts_all_gpu.dtype))).to(dtype=torch.float32).tolist()  # type: ignore[operator]
             import json as _json
             debug_fh.write(_json.dumps({
                 "step": len(order),
@@ -472,7 +472,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
                 expected_chunk_counts = (desired_next_total - E_chunk_start)
             else:
                 expected_chunk_counts = target_t * expected_chunk_tokens
-            chunk_residual = chunk_counts - expected_chunk_counts
+            chunk_residual = chunk_counts - expected_chunk_counts.to(dtype=chunk_counts.dtype)
             chunk_l2 = torch.norm(chunk_residual, p=2).item()
             chunk_reg_error = 0.0
             if use_reg:
