@@ -408,7 +408,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
             and 'doc_cluster_bin_prob' in locals()
         ):
             import json as _json
-            doc_add_step = doc_cluster_bin_prob.t().matmul(desired_add_step)
+            doc_add_step = doc_cluster_bin_prob.t().matmul(desired_add_step.to(dtype=counts_all_gpu.dtype))
             doc_additions_fh.write(_json.dumps({
                 str(len(order)): doc_add_step.to(dtype=torch.float32).tolist()
             }) + "\n")
@@ -503,7 +503,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
                     chunk_indices = order[-chunk_size:]
                     idx_t = torch.tensor(chunk_indices, device=device, dtype=torch.long)
                     chunk_token_hist = doc_hist_per_seq.index_select(0, idx_t).sum(dim=0)
-                    expected_chunk_tokens_per_bin = doc_cluster_bin_prob.t().matmul(expected_chunk_counts)
+                    expected_chunk_tokens_per_bin = doc_cluster_bin_prob.t().matmul(expected_chunk_counts.to(dtype=counts_all_gpu.dtype))
                     delta_chunk = chunk_token_hist - expected_chunk_tokens_per_bin
                     chunk_reg_error = float(torch.norm(delta_chunk, p=2).item())
             import json as _json
@@ -541,7 +541,7 @@ def greedy_gpu_sparse(counts_all_gpu: torch.Tensor, counts_sparse_gpu: torch.Ten
                 reg_expected = total_bucket_counts.to(dtype=torch.float32).tolist()  # type: ignore[union-attr]
             elif reg_type == "docsize_token_schedule" and 'cum_doc_tokens_per_bin' in locals():
                 reg_actual = cum_doc_tokens_per_bin.tolist()
-                reg_expected = (doc_cluster_bin_prob.t().matmul(E_prev)).to(dtype=torch.float32).tolist()  # type: ignore[operator]
+                reg_expected = (doc_cluster_bin_prob.t().matmul(E_prev.to(dtype=counts_all_gpu.dtype))).to(dtype=torch.float32).tolist()  # type: ignore[operator]
         import json as _json
         debug_fh.write(_json.dumps({
             "step": n_total,
