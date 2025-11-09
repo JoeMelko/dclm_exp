@@ -3,34 +3,43 @@ set -euo pipefail
 
 # Fill these parameters
 UUIDS=(
-  "iter0_1"
-  "iter0_2"
-  "iter0_4"
-  "iter0_8"
+  "avg2_1"
+  "avg2_2"
+  "avg2_4"
+  "avg2_8"
+  "avg2_16"
 )
 TAGS=(
   "ckpt1"
   "ckpt2"
   "ckpt4"
   "ckpt8"
+  "ckpt16"
 )
-BASE_OUT="/mnt/eu/home/jmelko/curric/mgd_multi"
-ITER=0
+BASE_OUT="/mnt/denver/home/jmelko/curric/mgd_avg/iter3"
+ITER=3
 COUNTS_JSONS=(
-  /mnt/eu/home/jmelko/curric/counts_subset0.json
-  /mnt/eu/home/jmelko/curric/counts_subset0.json
-  /mnt/eu/home/jmelko/curric/counts_subset0.json
-  /mnt/eu/home/jmelko/curric/counts_subset0.json
+  "/mnt/denver/home/jmelko/curric/mgd_avg/iter2/counts.json"
+  "/mnt/denver/home/jmelko/curric/mgd_avg/iter2/counts.json"
+  "/mnt/denver/home/jmelko/curric/mgd_avg/iter2/counts.json"
+  "/mnt/denver/home/jmelko/curric/mgd_avg/iter2/counts.json"
+  "/mnt/denver/home/jmelko/curric/mgd_avg/iter2/counts.json"
 )
 
 # Optional per-run global shard reader offsets (one per UUID). If left empty,
 # a default of 0 will be used for all runs.
-CF_GLOBAL_SHARD_OFFSETS=()
+CF_GLOBAL_SHARD_OFFSETS=(
+  0
+  0
+  4370
+  16931
+  42054  
+)
 
 # Optional overrides (leave empty to use defaults in run_full_workflow.sh)
-DATA_PARENT_DIR="/mnt/eu/home/jmelko/curric/400m_tok"
-WDS_DIR="/mnt/eu/home/jmelko/curric/baseline0_chunked/ready_to_train"
-OH_DIR="/mnt/eu/home/jmelko/curric/openhermes_tok_new"
+DATA_PARENT_DIR="/mnt/denver/home/jmelko/curric/400m_tok"
+WDS_DIR="/mnt/denver/home/jmelko/curric/mgd_avg/iter2/ready_to_train"
+OH_DIR="/mnt/denver/home/jmelko/curric/openhermes_tok_new"
 LORA_RANK=128
 NUM_BLOCKS=8
 NUM_GPUS=8

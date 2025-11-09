@@ -1,16 +1,16 @@
-#/bin/bash
+#!/bin/bash
 
 # Parameters
-INPUT_DIR=/mnt/denver/home/jmelko/curric/mgd_avg/iter3/1b_docs_tok
-OUT_DIR=/mnt/denver/home/jmelko/curric/mgd_avg/iter3/1b_docs_tok_ordered
-SHARD_SIZE=32
-TRUNCATE_MOD=256
-TOTAL_TOKENS=989859200
+INPUT_DIR=/mnt/denver/home/jmelko/curric/mgd_avg/iter2/docs_tok_merged
+OUT_DIR=/mnt/denver/home/jmelko/curric/mgd_avg/iter2/docs_tok_ordered
+SHARD_SIZE=64
+TRUNCATE_MOD=512
+TOTAL_TOKENS=1131944704
 SCRIPT=greedy_order_sparse_gpu_curric.py
 #RATIO_FILE=/mnt/denver/home/jmelko/curric/mgd_avg/iter2/schedule_gpu.json
 
 # Loop ranges
-I_MAX=8
+I_MAX=1
 J_MAX=8
 
 for i in $(seq 0 $((I_MAX-1))); do
@@ -22,7 +22,8 @@ for i in $(seq 0 $((I_MAX-1))); do
       --input-dir $INPUT_DIR/sub$SUB_ID \
       --out-dir $OUT_DIR/sub$SUB_ID \
       --shard-size $SHARD_SIZE \
-      --truncate-mod $TRUNCATE_MOD &
+      --truncate-mod $TRUNCATE_MOD \
+      --total-tokens $TOTAL_TOKENS &
   done
   wait
 done
