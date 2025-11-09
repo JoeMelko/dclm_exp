@@ -41,6 +41,7 @@ python -m dclm_exp.evals.eval_grad_svd \
 import argparse, io, json, gzip, math
 from pathlib import Path
 from typing import List, Optional
+import random
 
 import numpy as np
 import torch, tqdm
@@ -306,6 +307,24 @@ def main(args):
         raise FileNotFoundError(f"No files matching pattern '{args.pattern}' found under {wds_dir}")
 
     ds = wds.WebDataset([str(p) for p in files], handler=wds.handlers.ignore_and_continue)
+    # Optional full-dataset sample-level shuffle (streaming with bounded buffer)
+    if getattr(args, "shuffle", False):
+        buffer_size = int(getattr(args, "shuffle_buffer", 10000) or 10000)
+        rng = random.Random(int(getattr(args, "shuffle_seed", 1337) or 1337))
+        try:
+            # Newer WebDataset (may accept buffer_size and rng)
+            ds = ds.shuffle(buffer_size=buffer_size, initial=buffer_size, rng=rng)
+        except TypeError:
+            try:
+                # Alternate kw name used in some versions
+                ds = ds.shuffle(bufsize=buffer_size, initial=buffer_size, rng=rng)
+            except TypeError:
+                try:
+                    # Fallback: no rng kw supported, keep deterministic default elsewhere if needed
+                    ds = ds.shuffle(buffer_size, buffer_size)
+                except TypeError:
+                    # Last resort positional with initial as kw
+                    ds = ds.shuffle(buffer_size, initial=buffer_size)
     loader = wds.WebLoader(ds,
                            batch_size=args.mini_bz,
                            num_workers=args.num_workers,
@@ -372,4 +391,10 @@ if __name__ == "__main__":
                         help="Path to a JSONL file to append results to (will create if missing)")
     parser.add_argument("--every-k", dest="every_k", type=int, default=1,
                         help="Process only every k-th simulated batch; k=1 processes all (default: 1)")
+    parser.add_argument("--shuffle", action="store_true",
+                        help="Enable sample-level dataset shuffling with a bounded buffer")
+    parser.add_argument("--shuffle-buffer", type=int, default=10000,
+                        help="Shuffle buffer size (larger approximates fuller shuffle; default: 10000)")
+    parser.add_argument("--shuffle-seed", type=int, default=1337,
+                        help="Random seed for shuffling (default: 1337)")
     main(parser.parse_args()) 
